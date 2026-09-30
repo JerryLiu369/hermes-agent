@@ -48,9 +48,30 @@ def install_truststore() -> bool:
         import truststore
 
         truststore.inject_into_ssl()
+        # truststore 0.10.x leaves cert_store_stats()/get_ca_certs() as
+        # ``raise NotImplementedError()``, which breaks libraries that
+        # introspect the context (tunnel clients, CA-loading fallbacks).
+        # Restore the surface by delegating to the wrapped stdlib context.
+        def _cert_store_stats(self: Any) -> dict[str, int]:
+            return self._ctx.cert_store_stats()
+
+        def _get_ca_certs(self: Any, binary_form: bool = False) -> Any:
+            return self._ctx.get_ca_certs(binary_form)
+
+        truststore.SSLContext.cert_store_stats = _cert_store_stats  # type: ignore[method-assign]
+        truststore.SSLContext.get_ca_certs = _get_ca_certs  # type: ignore[method-assign]
+        probe = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        probe.cert_store_stats()
+        probe.get_ca_certs()
         _installed = True
         logger.debug("TLS trust: platform store (truststore)")
     except Exception as exc:  # noqa: BLE001 — never break startup over TLS setup
+        try:
+            import truststore as _truststore_rollback
+
+            _truststore_rollback.extract_from_ssl()
+        except Exception:  # noqa: BLE001 — rollback is best-effort
+            pass
         _installed = False
         logger.warning(
             "truststore unavailable (%s); falling back to OpenSSL's default "

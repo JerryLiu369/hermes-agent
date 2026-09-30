@@ -170,3 +170,63 @@ assert ctx.verify_mode == ssl.CERT_REQUIRED and ctx.check_hostname
 assert ctx.cert_store_stats()['x509_ca'] > 0
 """], capture_output=True, text=True, timeout=30)
     assert child.returncode == 0, child.stderr
+
+
+def test_injected_context_preserves_introspection():
+    """truststore 0.10.x leaves cert_store_stats()/get_ca_certs() raising
+    NotImplementedError, which poisons CA-loading fallbacks. The injected
+    context must introspect via its wrapped stdlib context instead."""
+    import subprocess
+    import sys
+
+    child = subprocess.run([sys.executable, "-c", """
+import ssl
+from agent.ssl_verify import install_truststore
+assert install_truststore() is True
+ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+try:
+    stats = ctx.cert_store_stats()
+except NotImplementedError:
+    raise AssertionError('cert_store_stats raised NotImplementedError')
+try:
+    cas = ctx.get_ca_certs()
+except NotImplementedError:
+    raise AssertionError('get_ca_certs raised NotImplementedError')
+assert isinstance(stats, dict) and 'x509_ca' in stats
+assert isinstance(cas, list)
+import certifi
+loaded = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+loaded.load_verify_locations(cafile=certifi.where())
+loaded_stats = loaded.cert_store_stats()
+assert loaded_stats['x509_ca'] > 0, loaded_stats
+assert len(loaded.get_ca_certs()) > 0
+"""], capture_output=True, text=True, timeout=30)
+    assert child.returncode == 0, child.stderr
+
+
+def test_probe_failure_rolls_back_to_stdlib():
+    """If the introspection probe fails, install_truststore() must extract
+    the injection and fall back cleanly instead of leaving a broken context."""
+    import subprocess
+    import sys
+
+    child = subprocess.run([sys.executable, "-c", """
+import ssl
+original = ssl.SSLContext
+import truststore
+calls = []
+orig_extract = truststore.extract_from_ssl
+def rec_extract(*args, **kwargs):
+    calls.append(True)
+    return orig_extract(*args, **kwargs)
+truststore.extract_from_ssl = rec_extract
+def failing_ctx(*args, **kwargs):
+    raise RuntimeError('probe boom')
+truststore.SSLContext = failing_ctx
+from agent.ssl_verify import install_truststore
+assert install_truststore() is False
+assert calls, 'extract_from_ssl not called on probe failure'
+assert ssl.SSLContext is original, ssl.SSLContext
+assert install_truststore() is False
+"""], capture_output=True, text=True, timeout=30)
+    assert child.returncode == 0, child.stderr
