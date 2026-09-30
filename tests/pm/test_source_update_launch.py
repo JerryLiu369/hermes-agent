@@ -591,3 +591,117 @@ def test_failed_tail_attempt_is_counted_and_success_clears_it(source_launch, tmp
     assert not completion_pending_path(root).exists()
     assert not _completion_attempts_path(root).exists(), "success cleared the attempt record"
 
+
+@pytest.mark.platforms("posix")
+def test_pending_completion_records_owner_and_charges_attempts(tmp_path, monkeypatch):
+    """The marker names its owner and age; each tail attempt spends re-entry budget (#127284)."""
+    import time
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / ".git").mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname='example'\n")
+    (root / "install-stamp.json").write_text(json.dumps({"updateMechanism": "self"}))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+    monkeypatch.delenv("HERMES_SUPERVISED_CHILD", raising=False)
+    monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)
+
+    pending = venv_sync.arm_completion(root)
+    owed = venv_sync.read_pending_completion(root)
+    assert owed is not None and owed.attempts == 0 and owed.pid == os.getpid()
+    assert owed.age_seconds < 60
+    assert "source update tail not finished" in pending.read_text(encoding="utf-8")
+
+    armed_at = next(
+        line for line in pending.read_text(encoding="utf-8").splitlines() if line.startswith("started_at=")
+    )
+    time.sleep(0.01)
+    assert venv_sync.record_pending_attempt(root) == 1
+    owed = venv_sync.read_pending_completion(root)
+    assert owed is not None and owed.attempts == 1
+    assert next(
+        line for line in pending.read_text(encoding="utf-8").splitlines() if line.startswith("started_at=")
+    ) == armed_at, "the arm time must survive an attempt so the age ceiling keeps counting"
+
+
+@pytest.mark.platforms("posix")
+def test_stale_pending_completion_is_dropped_instead_of_stranding_launches(tmp_path, monkeypatch):
+    """A marker past its age ceiling owes nothing and is deleted, not paid by every launch (#127284)."""
+    import time
+
+    import pm
+    from hermes_cli import _launchers
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / ".git").mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname='example'\n")
+    (root / "install-stamp.json").write_text(json.dumps({"updateMechanism": "self"}))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+    monkeypatch.delenv("HERMES_SUPERVISED_CHILD", raising=False)
+    monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)
+
+    pending = venv_sync.completion_pending_path(root)
+    pending.parent.mkdir(parents=True)
+    # Legacy bytes from an old updater: no metadata, so the mtime is the arm time.
+    pending.write_text("source update tail not finished\n", encoding="utf-8")
+    assert venv_sync.read_pending_completion(root) is not None, "a fresh legacy marker is still owed"
+
+    stale = time.time() - venv_sync.PENDING_COMPLETION_MAX_AGE_SECONDS - 60
+    os.utime(pending, (stale, stale))
+    assert venv_sync.read_pending_completion(root) is None
+    assert not pending.exists(), "an over-age marker must not strand later launches"
+
+    # Re-arm stale for the launch gate: prepare_launch must drop it without running the tail.
+    pending.write_text("source update tail not finished\n", encoding="utf-8")
+    os.utime(pending, (stale, stale))
+    monkeypatch.setattr(pm, "venv_is_current", lambda **kw: True)
+    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _: Path(sys.executable))
+    calls: list = []
+    monkeypatch.setattr(venv_sync.subprocess, "call", lambda *a, **k: (calls.append(a), 0)[1])
+
+    assert venv_sync.prepare_launch(root, []) is None
+    assert not pending.exists(), "an over-age marker must not strand later launches"
+    assert calls == []
+
+
+@pytest.mark.platforms("posix")
+def test_exhausted_pending_completion_budget_is_dropped_instead_of_rerunning_tail(tmp_path, monkeypatch):
+    """A tail that never finishes may be retried, but not forever (#127284)."""
+    import time
+
+    import pm
+    from hermes_cli import _launchers
+
+    root = tmp_path / "checkout"
+    root.mkdir()
+    (root / ".git").mkdir()
+    (root / "pyproject.toml").write_text("[project]\nname='example'\n")
+    (root / "install-stamp.json").write_text(json.dumps({"updateMechanism": "self"}))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.delenv("HERMES_DISABLE_LAZY_INSTALLS", raising=False)
+    monkeypatch.delenv("HERMES_SUPERVISED_CHILD", raising=False)
+    monkeypatch.delenv("HERMES_S6_SUPERVISED_CHILD", raising=False)
+
+    pending = venv_sync.completion_pending_path(root)
+    pending.parent.mkdir(parents=True)
+    pending.write_text(
+        "source update tail not finished\n"
+        f"pid={os.getpid()}\nstarted_at={time.time()}\n"
+        f"attempts={venv_sync.PENDING_COMPLETION_MAX_ATTEMPTS}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(pm, "venv_is_current", lambda **kw: True)
+    monkeypatch.setattr(_launchers, "resolve_store_python", lambda _: Path(sys.executable))
+    calls: list = []
+    monkeypatch.setattr(venv_sync.subprocess, "call", lambda *a, **k: (calls.append(a), 0)[1])
+
+    assert venv_sync.prepare_launch(root, []) is None
+    assert not pending.exists(), "an exhausted marker must not re-enter the tail"
+    assert calls == []
+
