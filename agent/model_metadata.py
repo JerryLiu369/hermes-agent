@@ -1313,6 +1313,10 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
         r'supports at most\s+(\d+)\s*(?:completion\s+)?tokens',
         # Scaleway: "max_completion_tokens is limited to 16384 for glm-5.2".
         r'(?:max_tokens|max_completion_tokens) is limited to\s*(\d+)',
+        # Direct comparisons (OpenAI-compat relays, AgnesAI, vLLM):
+        r'(?:exceeds|exceed)\s+the\s+limit\s+of\s*(\d+)',
+        r'(?:is\s+)?greater than the maximum of\s*(\d+)',
+        r'cannot be greater than\s*(?:max_model_len\s*=\s*)?(\d+)',
         r'=\s*(\d+)\s*$',
     ):
         match = re.search(pattern, error_lower)
@@ -1369,6 +1373,9 @@ _OUTPUT_CAP_SIGNALS = (
     ("output limit",), ("maximum allowed number of output tokens",),
     ("max_tokens is too large", "supports at most"), ("tokens from the input messages", "tokens for the completion"),
     ("limited to",),  # Scaleway: "max_completion_tokens is limited to 16384 for <model>" (#67453)
+    ("exceeds the limit of",), ("exceed the limit of",),
+    ("greater than the maximum of",),
+    ("cannot be greater than",),
 )
 _INPUT_OVERFLOW_SIGNALS = (
     "prompt is too long", "prompt too long", "input is too long", "input token",
@@ -1387,6 +1394,9 @@ _PARSEABLE_OUTPUT_CAP_SIGNALS = (
     ("output limit",), ("max_tokens", "maximum allowed number of output tokens"),
     ("max_tokens is too large", "supports at most"), ("tokens from the input messages", "tokens for the completion"),
     ("limited to",),
+    ("exceeds the limit of",), ("exceed the limit of",),
+    ("greater than the maximum of",),
+    ("cannot be greater than",),
 )
 
 
