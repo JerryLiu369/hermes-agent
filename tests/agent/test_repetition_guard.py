@@ -6,7 +6,16 @@ import random
 
 import pytest
 
-from agent.repetition_guard import MIN_FRAGMENT_LENGTH, is_repetition_dominated
+from agent.repetition_guard import (
+    MIN_FRAGMENT_LENGTH,
+    STOP_PATH_MIN_CHARS,
+    STREAM_REPETITION_MIN_CHARS,
+    STREAM_REPETITION_TAIL_CHARS,
+    StreamingRepetitionMonitor,
+    is_repetition_dominated,
+    is_runaway_repetition,
+    live_repetition_tail,
+)
 
 # The exact sentence from the #86581 incident (echoed hundreds of times by
 # the model before the provider cut it off at finish_reason=length).
@@ -86,3 +95,78 @@ class TestRepetitionGuard:
         assert is_repetition_dominated("") is False
         assert is_repetition_dominated(None) is False
         assert is_repetition_dominated(12345) is False
+
+
+class TestStreamingRepetitionGuard:
+    def test_monitor_initial_state(self):
+        monitor = StreamingRepetitionMonitor()
+        assert monitor.content_len == 0
+        assert monitor.reasoning_len == 0
+        assert monitor.next_content_check == STREAM_REPETITION_MIN_CHARS
+        assert monitor.next_reasoning_check == STREAM_REPETITION_MIN_CHARS
+        assert monitor.next_content_check == 16_000
+
+    def test_monitor_content_doubling(self):
+        monitor = StreamingRepetitionMonitor()
+        # Adding less than threshold -> False
+        assert monitor.add_content(10_000) is False
+        assert monitor.content_len == 10_000
+        # Reaching threshold (16_000) -> True
+        assert monitor.add_content(6_000) is True
+        assert monitor.content_len == 16_000
+
+        # Advance threshold doubles next check to 32_000
+        monitor.advance_content()
+        assert monitor.next_content_check == 32_000
+        assert monitor.add_content(15_000) is False
+        assert monitor.add_content(1_000) is True
+        assert monitor.content_len == 32_000
+
+        # Next doubling is 64_000
+        monitor.advance_content()
+        assert monitor.next_content_check == 64_000
+
+    def test_monitor_reasoning_independent(self):
+        monitor = StreamingRepetitionMonitor()
+        # Reasoning progresses independently of content
+        assert monitor.add_reasoning(16_000) is True
+        assert monitor.reasoning_len == 16_000
+        assert monitor.content_len == 0
+        assert monitor.next_content_check == 16_000
+
+        monitor.advance_reasoning()
+        assert monitor.next_reasoning_check == 32_000
+        assert monitor.next_content_check == 16_000
+
+        # Content can still trigger at 16_000
+        assert monitor.add_content(16_000) is True
+        assert monitor.content_len == 16_000
+
+    def test_live_repetition_tail_bounding(self):
+        # Short text returned as-is
+        short = "a" * 100
+        assert live_repetition_tail(short) == short
+
+        # Text equal to tail chars returned as-is
+        exact = "x" * STREAM_REPETITION_TAIL_CHARS
+        assert live_repetition_tail(exact) == exact
+
+        # Text longer than tail chars truncated to last STREAM_REPETITION_TAIL_CHARS
+        long_text = ("prefix_" * 10_000) + ("tail_" * 15_000)
+        tail = live_repetition_tail(long_text)
+        assert len(tail) == STREAM_REPETITION_TAIL_CHARS
+        assert tail == long_text[-STREAM_REPETITION_TAIL_CHARS:]
+
+    def test_streaming_runaway_content_and_reasoning_detection(self):
+        repeated_sentence = "The model is currently processing your request and analyzing the results.\n"
+        loop_text = repeated_sentence * 300
+        assert len(loop_text) >= STOP_PATH_MIN_CHARS
+
+        # live_repetition_tail feeding into is_runaway_repetition
+        tail = live_repetition_tail(loop_text)
+        assert is_runaway_repetition(tail) is True
+
+        # Non-repetitive text of equal length must not trigger
+        unique_text = "\n".join(f"Unique line {i} explaining distinct topic details." for i in range(500))
+        assert len(unique_text) >= STOP_PATH_MIN_CHARS
+        assert is_runaway_repetition(live_repetition_tail(unique_text)) is False

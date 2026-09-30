@@ -45,6 +45,56 @@ _RUNAWAY_DISTINCT_LINE_RATIO = 0.5
 # identical table rows, templated YAML) stay in the low KB and must be delivered.
 STOP_PATH_MIN_CHARS = 16_000
 
+# Live-streaming guard (#127234): the same runaway criterion as the stop path, applied
+# while the stream is still open so a loop on an uncapped endpoint cannot stream forever.
+# First check at runaway scale, then at every doubling so cost stays logarithmic in
+# stream length. Checks run on a bounded tail so the per-check cost stays flat even
+# past 1M chars (a full-buffer scan costs ~1s/MB on the stream thread).
+STREAM_REPETITION_MIN_CHARS = STOP_PATH_MIN_CHARS
+STREAM_REPETITION_TAIL_CHARS = 64_000
+
+
+def live_repetition_tail(text: str) -> str:
+    """Bounded tail for a live repetition check (see ``STREAM_REPETITION_TAIL_CHARS``)."""
+    if len(text) > STREAM_REPETITION_TAIL_CHARS:
+        return text[-STREAM_REPETITION_TAIL_CHARS:]
+    return text
+
+
+class StreamingRepetitionMonitor:
+    """Doubling live-check state for one stream, tracked per channel.
+
+    Content and reasoning are judged independently: either channel hitting the
+    stop path's own criterion ends the stream. Thresholds double after each
+    negative check so a 1M-char stream performs ~6 checks, not per-chunk scans.
+    """
+
+    def __init__(self) -> None:
+        self.content_len = 0
+        self.reasoning_len = 0
+        self.next_content_check = STREAM_REPETITION_MIN_CHARS
+        self.next_reasoning_check = STREAM_REPETITION_MIN_CHARS
+
+    def add_content(self, n: int) -> bool:
+        """Account for ``n`` new content chars; True when a check is now due."""
+        if n > 0:
+            self.content_len += n
+        return self.content_len >= self.next_content_check
+
+    def add_reasoning(self, n: int) -> bool:
+        """Account for ``n`` new reasoning chars; True when a check is now due."""
+        if n > 0:
+            self.reasoning_len += n
+        return self.reasoning_len >= self.next_reasoning_check
+
+    def advance_content(self) -> None:
+        """Mark the current content threshold checked without a hit (doubles)."""
+        self.next_content_check *= 2
+
+    def advance_reasoning(self) -> None:
+        """Mark the current reasoning threshold checked without a hit (doubles)."""
+        self.next_reasoning_check *= 2
+
 
 def is_repetition_dominated(text: str) -> bool:
     """True when a contiguous run of at least five exact repetitions covers at least half

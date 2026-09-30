@@ -7,6 +7,7 @@ re-prompt, scaffolding pop, stop gates, then the durable final flush. Extracted 
 
 from __future__ import annotations
 
+import contextlib
 from dataclasses import dataclass
 import logging
 from typing import Any, Dict, Optional
@@ -261,6 +262,25 @@ def finish_text_response(
         final_response
         and len(final_response) >= STOP_PATH_MIN_CHARS
         and is_runaway_repetition(final_response)
+    ):
+        line, user_response, error = _REPETITION_STOPPED
+        agent._vprint(f"{agent.log_prefix}{line}", force=True, diagnostic=True)
+        agent._cleanup_task_resources(effective_task_id)
+        agent._persist_session(messages, conversation_history)
+        return _verdict("return", stamp_failure(
+            partial_result(messages, api_call_count, user_response, error), "truncated", True,
+        ))
+
+    # Reasoning-channel loops (#127234): a visible prefix must not hide a runaway
+    # thought in reasoning_content / reasoning / Anthropic thinking. Same scale and
+    # shape as the visible path; the loop is discarded, not persisted or continued.
+    _reasoning_text: Any = None
+    with contextlib.suppress(Exception):
+        _reasoning_text = agent._extract_reasoning(assistant_message)
+    if (
+        isinstance(_reasoning_text, str)
+        and len(_reasoning_text) >= STOP_PATH_MIN_CHARS
+        and is_runaway_repetition(_reasoning_text)
     ):
         line, user_response, error = _REPETITION_STOPPED
         agent._vprint(f"{agent.log_prefix}{line}", force=True, diagnostic=True)

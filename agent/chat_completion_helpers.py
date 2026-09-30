@@ -50,7 +50,9 @@ from agent.reasoning_summaries import (
     append_streamed_reasoning_detail, separate_glued_reasoning_blocks,
     streamed_reasoning_detail_text,
 )
-from agent.repetition_guard import is_repetition_dominated
+from agent.repetition_guard import (
+    StreamingRepetitionMonitor, is_repetition_dominated, is_runaway_repetition, live_repetition_tail,
+)
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool_lifecycle import is_persistent_env
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
@@ -3144,6 +3146,22 @@ class _StreamingCall(StreamingWaitMonitor):
             "single-writer invariant (model=%s).", label, self.api_kwargs.get("model", "unknown"))
         return False
 
+    def _live_repetition_check_due(self, monitor: StreamingRepetitionMonitor, *, channel: str) -> bool:
+        """True when the channel reached its next doubling threshold (no tool call in flight)."""
+        if self.result.get("partial_tool_names") or self.provider_tool_in_flight.get("yes"):
+            return False
+        if channel == "content":
+            return monitor.content_len >= monitor.next_content_check
+        return monitor.reasoning_len >= monitor.next_reasoning_check
+
+    def _close_stream_on_repetition(self, stream: Any, *, channel: str, chars: int) -> None:
+        """Close an infinite loop on its owner thread; the caller ends the turn via stop path."""
+        logger.warning(
+            "Streaming repetition loop detected in %s (%d chars); closing stream "
+            "(model=%s).", channel, chars, self.api_kwargs.get("model", "unknown"))
+        with contextlib.suppress(Exception):
+            stream.close()
+
     def _call_chat_completions(self, stream_attempt_id: int):
         """Stream a chat completions response."""
         import httpx as _httpx
@@ -3155,6 +3173,11 @@ class _StreamingCall(StreamingWaitMonitor):
         # (a provider that mirrors the same text in both fields would otherwise read
         # as already-glued on the first chunk and get a spurious break).
         detail_display_parts: list[str] = []
+        # Live repetition guard (#127234): raw-channel accumulators judged at runaway
+        # scale on the worker thread, so callbacks (or their absence) cannot hide a loop.
+        repetition_monitor = StreamingRepetitionMonitor()
+        repetition_live_reasoning_parts: list[str] = []
+        streaming_repetition_hit: str | None = None
         # OpenAI structured refusal (``delta.refusal``): the explanation streams here and
         # ``delta.content`` stays empty, so an un-accumulated refusal looks like an empty
         # stream and burns the empty-response retries (the non-streaming fix is #46013).
@@ -3267,6 +3290,23 @@ class _StreamingCall(StreamingWaitMonitor):
             display_reasoning = detail_text or reasoning_text
             if display_reasoning:
                 self._emit_reasoning(display_reasoning)
+                if not tool_calls_acc:
+                    repetition_live_reasoning_parts.append(display_reasoning)
+                    if repetition_monitor.add_reasoning(len(display_reasoning)):
+                        if self._live_repetition_check_due(
+                            repetition_monitor, channel="reasoning"
+                        ):
+                            if is_runaway_repetition(
+                                live_repetition_tail("".join(repetition_live_reasoning_parts))
+                            ):
+                                self._close_stream_on_repetition(
+                                    stream, channel="reasoning",
+                                    chars=repetition_monitor.reasoning_len,
+                                )
+                                streaming_repetition_hit = "reasoning"
+                                finish_reason = "stop"
+                                break
+                            repetition_monitor.advance_reasoning()
             # Not routed to the live display: the transport promotes a sole-payload
             # refusal to content + ``content_filter`` and the loop surfaces it terminally.
             delta_refusal = getattr(delta, "refusal", None)
@@ -3280,6 +3320,21 @@ class _StreamingCall(StreamingWaitMonitor):
             delta_content = flatten_message_text(getattr(delta, "content", None), sep="")
             if delta_content:
                 content_parts.append(delta_content)
+                if not tool_calls_acc and repetition_monitor.add_content(len(delta_content)):
+                    if self._live_repetition_check_due(
+                        repetition_monitor, channel="content"
+                    ):
+                        if is_runaway_repetition(
+                            live_repetition_tail("".join(content_parts))
+                        ):
+                            self._close_stream_on_repetition(
+                                stream, channel="content",
+                                chars=repetition_monitor.content_len,
+                            )
+                            streaming_repetition_hit = "content"
+                            finish_reason = "stop"
+                            break
+                        repetition_monitor.advance_content()
                 if tool_calls_acc:
                     self._route_suppressed_text(delta_content)
                 elif (pending_text_parts or _provider_stream_text_may_be_sse(delta_content)
@@ -3475,6 +3530,12 @@ class _StreamingCall(StreamingWaitMonitor):
         # No message_stop -> EmptyStreamError; saw_stream_event only picks the message.
         saw_stream_event = False
         saw_message_stop = False
+        # Live repetition guard (#127234): raw-channel doubling check, same criterion
+        # as the stop path, so an uncapped stream cannot loop forever.
+        repetition_monitor = StreamingRepetitionMonitor()
+        repetition_content_parts: list[str] = []
+        repetition_reasoning_parts: list[str] = []
+        streaming_repetition_hit: str | None = None
         self.last_chunk_time["t"] = time.time()
         _diag = self._new_diag()
         self._writer_token = self._attempt_stream_response = None
@@ -3535,10 +3596,66 @@ class _StreamingCall(StreamingWaitMonitor):
                         text = getattr(delta, "text", "")
                         if text and not has_tool_use:
                             self._emit_text(text)
+                            repetition_content_parts.append(text)
+                            if repetition_monitor.add_content(len(text)):
+                                if self._live_repetition_check_due(
+                                    repetition_monitor, channel="content"
+                                ):
+                                    if is_runaway_repetition(
+                                        live_repetition_tail("".join(repetition_content_parts))
+                                    ):
+                                        self._close_stream_on_repetition(
+                                            stream, channel="content",
+                                            chars=repetition_monitor.content_len,
+                                        )
+                                        streaming_repetition_hit = "content"
+                                        break
+                                    repetition_monitor.advance_content()
                     elif delta_type == "thinking_delta" and getattr(delta, "thinking", ""):
                         self._emit_reasoning(delta.thinking)
+                        if not has_tool_use:
+                            repetition_reasoning_parts.append(delta.thinking)
+                            if repetition_monitor.add_reasoning(len(delta.thinking)):
+                                if self._live_repetition_check_due(
+                                    repetition_monitor, channel="reasoning"
+                                ):
+                                    if is_runaway_repetition(
+                                        live_repetition_tail("".join(repetition_reasoning_parts))
+                                    ):
+                                        self._close_stream_on_repetition(
+                                            stream, channel="reasoning",
+                                            chars=repetition_monitor.reasoning_len,
+                                        )
+                                        streaming_repetition_hit = "reasoning"
+                                        break
+                                    repetition_monitor.advance_reasoning()
             raw_stream = _stream_context["stream"]
-            if not self.agent._interrupt_requested and raw_stream is not None:
+            if streaming_repetition_hit is not None:
+                # Closed an infinite loop on its owner thread: synthesize a clean
+                # stop so the turn ends through the existing repetition stop
+                # instead of the drop/continuation path. The looped text is carried
+                # in the synthetic blocks directly so both the managed (Relay)
+                # and unmanaged (test double) paths see it without relying on the
+                # accumulator, which only observes in the managed path.
+                from types import SimpleNamespace as _SimpleNamespace
+
+                if streaming_repetition_hit == "content":
+                    _loop_blocks = [
+                        _SimpleNamespace(
+                            type="text", text="".join(repetition_content_parts),
+                        )
+                    ]
+                else:
+                    _loop_blocks = [
+                        _SimpleNamespace(
+                            type="thinking",
+                            thinking="".join(repetition_reasoning_parts),
+                        )
+                    ]
+                base_final_message = _SimpleNamespace(
+                    stop_reason="end_turn", content=_loop_blocks, usage=None,
+                )
+            elif not self.agent._interrupt_requested and raw_stream is not None:
                 if not saw_message_stop:
                     raise EmptyStreamError(
                         "Anthropic Messages stream ended before message_stop (possible upstream stream drop)."
@@ -3560,6 +3677,10 @@ class _StreamingCall(StreamingWaitMonitor):
 
         if self.agent._interrupt_requested:
             return None
+        if streaming_repetition_hit is not None:
+            # Synthetic stop already carries the looped blocks; return it directly
+            # (never the accumulator fast path, which would drop them unmanaged).
+            return self._check_anthropic_message(base_final_message)
         if base_final_message is not None:
             self._check_anthropic_message(base_final_message, tool_drop=False)
             if not stream.output_modified:
