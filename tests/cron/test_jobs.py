@@ -1977,3 +1977,129 @@ class TestEnsureCronDirWidened:
         with pytest.raises(FileNotFoundError):
             jobs._ensure_cron_dir(scripts_dir)
         assert not deleted_home.exists()
+
+
+# =========================================================================
+# croniter import retry + error-state recovery (#127182)
+# =========================================================================
+
+class TestCroniterImportRetry127182:
+    """When croniter import fails, recurring cron jobs must not wedge forever.
+
+    Before #127182, _ensure_croniter() latched HAS_CRONITER=False on the first
+    ImportError, so every later compute_next_run() returned None without
+    re-probing: jobs stayed enabled with next_run_at unset, only logging
+    warnings. Recovery also left state='error' after next_run_at came back.
+    """
+
+    def test_ensure_croniter_does_not_latch_import_error(self, monkeypatch):
+        """A failed import leaves HAS_CRONITER as None and re-probes next call."""
+        import sys
+
+        import cron.jobs as jobs_mod
+        import pm.environments as pm_env
+
+        calls: list = []
+        monkeypatch.setattr(
+            pm_env, "activate_dependencies", lambda root: calls.append(root))
+        monkeypatch.setitem(sys.modules, "croniter", None)
+        monkeypatch.setattr(jobs_mod, "HAS_CRONITER", None, raising=False)
+        monkeypatch.setattr(jobs_mod, "croniter", None, raising=False)
+
+        assert jobs_mod._ensure_croniter() is False
+        assert jobs_mod.HAS_CRONITER is None
+        assert jobs_mod._ensure_croniter() is False
+        assert jobs_mod.HAS_CRONITER is None
+        assert len(calls) == 2
+
+    def test_ensure_croniter_recovers_when_croniter_returns(self, monkeypatch):
+        """Once croniter is importable again, the next probe succeeds."""
+        pytest.importorskip("croniter")
+        import sys
+
+        import cron.jobs as jobs_mod
+        import pm.environments as pm_env
+
+        monkeypatch.setattr(pm_env, "activate_dependencies", lambda root: None)
+        monkeypatch.setitem(sys.modules, "croniter", None)
+        monkeypatch.setattr(jobs_mod, "HAS_CRONITER", None, raising=False)
+        monkeypatch.setattr(jobs_mod, "croniter", None, raising=False)
+
+        assert jobs_mod._ensure_croniter() is False
+        assert jobs_mod.HAS_CRONITER is None
+
+        monkeypatch.delitem(sys.modules, "croniter", raising=False)
+        assert jobs_mod._ensure_croniter() is True
+        assert jobs_mod.HAS_CRONITER is True
+        assert jobs_mod.croniter is not None
+
+    def test_compute_next_run_warning_includes_executable(
+        self, monkeypatch, caplog
+    ):
+        """The missing-croniter warning names the interpreter for diagnosis."""
+        import logging
+        import sys
+
+        import cron.jobs as jobs_mod
+        import pm.environments as pm_env
+
+        monkeypatch.setattr(pm_env, "activate_dependencies", lambda root: None)
+        monkeypatch.setitem(sys.modules, "croniter", None)
+        monkeypatch.setattr(jobs_mod, "HAS_CRONITER", None, raising=False)
+        monkeypatch.setattr(jobs_mod, "croniter", None, raising=False)
+
+        with caplog.at_level(logging.WARNING, logger="cron.jobs"):
+            assert jobs_mod.compute_next_run(
+                {"kind": "cron", "expr": "0 9 * * *"}) is None
+        assert jobs_mod.HAS_CRONITER is None
+        assert sys.executable in caplog.text
+
+    def test_recover_missing_next_run_restores_error_interval(
+        self, tmp_cron_dir
+    ):
+        """An error-state interval job with no next_run_at returns scheduled."""
+        save_jobs([{
+            "id": "interval-error-recover",
+            "name": "interval-error-recover",
+            "prompt": "x",
+            "schedule": {"kind": "interval", "minutes": 60},
+            "repeat": {"times": None, "completed": 0},
+            "enabled": True,
+            "state": "error",
+            "next_run_at": None,
+            "last_run_at": None,
+            "created_at": _hermes_now().isoformat(),
+            "deliver": "local",
+        }])
+
+        get_due_jobs()
+
+        recovered = get_job("interval-error-recover")
+        assert recovered is not None
+        assert recovered["next_run_at"] is not None
+        assert recovered["state"] == "scheduled"
+
+    def test_recover_missing_next_run_restores_error_cron(self, tmp_cron_dir):
+        """End-to-end wedge: croniter loss parks the job, return heals it."""
+        pytest.importorskip("croniter")
+        import cron.jobs as jobs_mod
+
+        job = create_job(prompt="Recurring", schedule="0 9 * * *")
+        assert job["schedule"]["kind"] == "cron"
+
+        jobs = load_jobs()
+        for record in jobs:
+            if record["id"] == job["id"]:
+                record["state"] = "error"
+                record["next_run_at"] = None
+        save_jobs(jobs)
+        assert get_job(job["id"])["state"] == "error"
+
+        # HAS_CRONITER must not be latched False, or recovery can never run.
+        assert jobs_mod.HAS_CRONITER is not False
+
+        get_due_jobs()
+
+        recovered = get_job(job["id"])
+        assert recovered["next_run_at"] is not None
+        assert recovered["state"] == "scheduled"

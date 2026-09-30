@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 import json
 import logging
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -46,7 +47,14 @@ HAS_CRONITER: Optional[bool] = None
 
 
 def _ensure_croniter() -> bool:
-    """Import croniter on first use; honor a pre-set HAS_CRONITER override."""
+    """Import croniter on first use; honor a pre-set HAS_CRONITER override.
+
+    An ImportError is NOT latched: the scheduler's runtime environment may gain
+    croniter later (reinstall, PM activation), so leave HAS_CRONITER as None so
+    the next call re-probes instead of wedging every recurring cron job forever
+    (#127182). As a best-effort repair, try PM's committed dependency
+    activation once before giving up.
+    """
     global croniter, HAS_CRONITER
     if HAS_CRONITER is None:
         try:
@@ -54,7 +62,20 @@ def _ensure_croniter() -> bool:
             croniter = _croniter
             HAS_CRONITER = True
         except ImportError:
-            HAS_CRONITER = False
+            try:
+                from pathlib import Path as _Path
+                from pm.environments import activate_dependencies as _activate
+
+                _activate(_Path(__file__).resolve().parent.parent)
+                from croniter import croniter as _retried
+
+                croniter = _retried
+                HAS_CRONITER = True
+            except Exception:
+                # Leave HAS_CRONITER as None so the next call re-probes.
+                logger.debug(
+                    "croniter import failed; will retry on next use",
+                    exc_info=True)
     return bool(HAS_CRONITER)
 
 
@@ -1185,9 +1206,9 @@ def compute_next_run(schedule: Dict[str, Any], last_run_at: Optional[str] = None
         if not _ensure_croniter():
             logger.warning(
                 "Cannot compute next run for cron schedule %r: 'croniter' is "
-                "not installed. croniter is a core dependency as of v0.9.x; "
+                "not installed (sys.executable=%s). croniter is a core dependency as of v0.9.x; "
                 "reinstall hermes-agent or run 'pip install croniter' in your runtime env.",
-                expr)
+                expr, sys.executable)
             return None
         # Anchor cron matching to the CONFIGURED IANA timezone's WALL CLOCK,
         # not to the UTC offset carried by ``base_time``. croniter ignores
@@ -2957,10 +2978,17 @@ def _recover_missing_next_run(job: Dict[str, Any], scan: _DueScan) -> Optional[s
     if not recovered_next:
         return None
     job["next_run_at"] = recovered_next
-    logger.info(
-        "Job '%s' had no next_run_at; recovering %s run at %s",
-        job.get("name", job.get("id", "?")), recovery_kind, recovered_next)
-    scan.persist(job["id"], next_run_at=recovered_next)
+    if kind in {"cron", "interval"} and job.get("state") == "error":
+        job["state"] = "scheduled"
+        logger.info(
+            "Job '%s' had no next_run_at; recovering %s run at %s (restoring state to 'scheduled')",
+            job.get("name", job.get("id", "?")), recovery_kind, recovered_next)
+        scan.persist(job["id"], next_run_at=recovered_next, state="scheduled")
+    else:
+        logger.info(
+            "Job '%s' had no next_run_at; recovering %s run at %s",
+            job.get("name", job.get("id", "?")), recovery_kind, recovered_next)
+        scan.persist(job["id"], next_run_at=recovered_next)
     return recovered_next
 
 
