@@ -65,6 +65,21 @@ def _staged_bash() -> str | None:
 _WINDOWS_BASH_STUB_DIRS = ("system32", "windowsapps")
 
 
+def is_windows_app_alias(path: str | None) -> bool:
+    """Whether *path* is a Windows App Execution Alias stub (#129102).
+
+    Every entry under ``%LOCALAPPDATA%\\Microsoft\\WindowsApps`` is a 0-byte
+    MSIX reparse point, not a real binary: ``python.exe``/``python3.exe``
+    there print "Python was not found ..." (Store redirector) instead of
+    running. Pure path data via ``ntpath`` so it is testable without faking
+    the host OS; MSYS-style ``/c/.../WindowsApps/python3`` spellings count.
+    """
+    if not path:
+        return False
+    norm = ntpath.normpath(path).lower().replace("/", "\\")
+    return "windowsapps" in [p for p in norm.split("\\") if p]
+
+
 def windows_bash_candidates(on_path: str | None, env: Mapping[str, str]) -> list[str]:
     """Ordered bash.exe candidates for a Windows host, as pure data: the
     explicit override and Git for Windows roots first, then ``on_path``
