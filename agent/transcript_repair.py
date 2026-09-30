@@ -88,6 +88,39 @@ def is_content_blank(content: Any) -> bool:
     return False
 
 
+def _matching_active_row_by_content_timestamp(
+    conn: sqlite3.Connection,
+    session_id: str,
+    msg: Mapping[str, Any],
+    role: str,
+    encode_content_fn: Callable[[Any], Any],
+):
+    """Active row with the same (role, content, timestamp) as an identity-less dict, or None.
+
+    Idempotent-insert guard for #129368: a re-flushed copy that lost ``_row_id`` (and its
+    persisted marker) still carries the timestamp the first insert stamped, so the triple
+    names the same logical message. Timestamp precision (microsecond floats, +1e-6 per row
+    in a batch) makes an unrelated collision vanishingly unlikely; genuinely new rows
+    either lack a timestamp or carry a fresh one and miss. Newest wins when duplicates
+    already exist, so a third copy still cannot land.
+    """
+    timestamp = msg.get("timestamp")
+    if timestamp is None or (msg.get("content") is None and not msg.get("tool_calls")):
+        return None
+    try:
+        stored_content = encode_content_fn(msg.get("content"))
+    except Exception:
+        return None
+    try:
+        return conn.execute(
+            "SELECT * FROM messages WHERE session_id = ? AND active = 1 AND role = ? "
+            "AND content IS ? AND timestamp IS ? ORDER BY id DESC LIMIT 1",
+            (session_id, role, stored_content, timestamp),
+        ).fetchone()
+    except Exception:
+        return None
+
+
 def resolve_and_repair_transcript_batch(
     conn: sqlite3.Connection,
     session_id: str,
@@ -110,6 +143,15 @@ def resolve_and_repair_transcript_batch(
         target_row = None
         if isinstance(existing_row_id, int):
             target_row = _active_message_row(conn, session_id, existing_row_id, role)
+        if target_row is None and isinstance(msg, dict):
+            # Idempotent-insert guard (#129368): a dict without durable identity that
+            # still carries its timestamp + content is a re-flush of the same logical
+            # message (the copy lost _row_id/marker but kept its timestamp). Adopt the
+            # existing active row instead of inserting a byte-identical duplicate.
+            target_row = _matching_active_row_by_content_timestamp(
+                conn, session_id, msg, role, encode_content_fn)
+            if target_row is not None:
+                msg["_row_id"] = int(target_row["id"])
         if target_row is None:
             inserted_rows.append(msg)
             continue
