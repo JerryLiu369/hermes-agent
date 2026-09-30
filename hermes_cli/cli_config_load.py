@@ -118,9 +118,15 @@ _AUXILIARY_TASK_ENV = {
 _CWD_PLACEHOLDERS = (".", "auto", "cwd")
 
 
-def _mirror_config_to_env(defaults, _file_has_terminal_config):
-    """Project config.yaml values into the env vars the tool modules read (terminal/browser/auxiliary/security/sessions). Env always wins when already set."""
-    from cli import _AUXILIARY_TASK_ENV, _CWD_PLACEHOLDERS, _TERMINAL_ENV_MAPPINGS
+def _mirror_config_to_env(defaults, _file_has_terminal_config=False, file_terminal_keys=None):
+    """Project config.yaml values into the env vars the tool modules read (terminal/browser/auxiliary/security/sessions).
+
+    Env always wins when already set, unless the file explicitly set that
+    terminal key. ``file_terminal_keys`` is the set of keys present in the
+    raw file's ``terminal`` section (``None`` = legacy caller: fall back to
+    ``_file_has_terminal_config``). Unset env vars are still backfilled from
+    merged defaults. ``backend`` and legacy ``env_type`` are aliases.
+    """
     terminal_config = defaults.get("terminal", {})
 
     # "backend" (documented) and legacy "env_type" are both accepted; "backend" wins.
@@ -146,7 +152,20 @@ def _mirror_config_to_env(defaults, _file_has_terminal_config):
         if env_var == "TERMINAL_CWD":
             if not _is_gateway:
                 os.environ[env_var] = str(val)
-        elif _file_has_terminal_config or env_var not in os.environ:
+        elif env_var not in os.environ:
+            os.environ[env_var] = json.dumps(val) if isinstance(val, (list, dict)) else str(val)
+        elif file_terminal_keys is not None:
+            # Beating a .env value needs that exact key in the file (#129418):
+            # merged defaults must not clobber e.g. TERMINAL_DOCKER_VOLUMES
+            # just because the file has some other terminal section.
+            explicit = config_key in file_terminal_keys
+            if not explicit and config_key == "env_type" and "backend" in file_terminal_keys:
+                explicit = True
+            if not explicit and config_key == "backend" and "env_type" in file_terminal_keys:
+                explicit = True
+            if explicit:
+                os.environ[env_var] = json.dumps(val) if isinstance(val, (list, dict)) else str(val)
+        elif _file_has_terminal_config:
             os.environ[env_var] = json.dumps(val) if isinstance(val, (list, dict)) else str(val)
 
     browser_config = defaults.get("browser", {})
@@ -269,6 +288,7 @@ def load_cli_config() -> Dict[str, Any]:
 
     # Only a file's terminal section may overwrite terminal env vars already set by .env.
     _file_has_terminal_config = False
+    file_terminal_keys: set[str] = set()
 
     if config_path.exists():
         try:
@@ -278,6 +298,14 @@ def load_cli_config() -> Dict[str, Any]:
                 file_config = _normalize_root_model_keys(fast_safe_load(f) or {})
 
             _file_has_terminal_config = "terminal" in file_config
+            raw_terminal = file_config.get("terminal")
+            if isinstance(raw_terminal, dict):
+                file_terminal_keys = set(raw_terminal.keys())
+                # "backend" (documented) and legacy "env_type" alias each other for TERMINAL_ENV.
+                if "backend" in file_terminal_keys:
+                    file_terminal_keys.add("env_type")
+                if "env_type" in file_terminal_keys:
+                    file_terminal_keys.add("backend")
             _merge_file_config(defaults, file_config)
         except Exception as e:
             logger.warning("Failed to load cli-config.yaml: %s", e)
@@ -292,7 +320,7 @@ def load_cli_config() -> Dict[str, Any]:
 
     defaults = managed_scope.apply_managed_overlay(defaults)
 
-    _mirror_config_to_env(defaults, _file_has_terminal_config)
+    _mirror_config_to_env(defaults, _file_has_terminal_config, file_terminal_keys)
 
     return defaults
 
