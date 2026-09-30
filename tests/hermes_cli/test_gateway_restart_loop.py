@@ -379,6 +379,30 @@ class TestProfileFlagGatewayLifecycle:
         assert not _contains_gateway_lifecycle_command("hermes -p zeus gateway restart")
         assert _contains_gateway_lifecycle_command("hermes gateway restart")
 
+    def test_catastrophic_backtracking_flags_performance(self):
+        """#129281: commands with many flags or repetitive patterns must not cause catastrophic backtracking."""
+        import time
+
+        commands = [
+            # Exact reproduction shape from #129281:
+            "rclone lsf $HOME/.hermes --recursive --files-only " + " ".join(["--exclude"] * 58) + " 2>/dev/null",
+            # hermes with many flags and no lifecycle command:
+            "hermes --recursive --files-only " + " ".join(["--exclude"] * 58),
+            # hermes with flags and values:
+            "hermes " + " ".join([f"--flag{i} val{i}" for i in range(50)]) + " status",
+            # hermes with profile zeus and many flags targeting restart:
+            "hermes -p zeus " + " ".join([f"--flag{i} val{i}" for i in range(50)]) + " gateway restart",
+        ]
+        for cmd in commands:
+            t0 = time.perf_counter()
+            res = _contains_gateway_lifecycle_command(cmd)
+            duration = time.perf_counter() - t0
+            assert duration < 0.2, f"Command took too long ({duration:.3f}s): {cmd[:60]}..."
+            if "gateway restart" in cmd:
+                assert res is True
+            else:
+                assert res is False
+
 
 class TestCronCreateLifecycleBlock:
     """Verify cron create rejects gateway lifecycle prompts."""

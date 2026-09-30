@@ -245,13 +245,14 @@ _ARGV_LIST_PUNCTUATION = re.compile(r"[\[\],]+")
 # the self-targeting shape (named profile == the profile running the guard). See #78028.
 _PROFILE_FLAG_LIFECYCLE_PATTERN = re.compile(
     r"(?i)"
-    r"hermes\s+"
-    # Any global flags before the profile selector (each may carry a value).
-    r"(?:-{1,2}\S+(?:\s+\S+)?\s+)*"
+    r"(?:(?<![/\w.\-])hermes(?:\.(?:exe|cmd|bat|com|ps1))?\s+)"
+    # Any global flags before the profile selector. Keep each token disjoint so
+    # malformed flag runs cannot trigger catastrophic backtracking (#129281).
+    r"(?:-[^\s=]+(?:=[^\s]+|\s+(?!-|gateway\b)[^\s]+)?\s+)*"
     # The selector: exactly the shapes the CLI's `_apply_profile_override` accepts.
     r"(?:--profile=([^\s]+)|(?:-p|--profile)\s+([^\s]+))"
     # Any global flags between the selector and the subcommand.
-    r"(?:\s+-{1,2}\S+(?:\s+\S+)?)*"
+    r"(?:\s+-[^\s=]+(?:=[^\s]+|\s+(?!-|gateway\b)[^\s]+)?)*"
     r"\s+gateway\s+(?:restart|stop)"
 )
 
@@ -426,13 +427,16 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     # selector sits between `hermes` and `gateway`. It is only the same foot-gun when the named profile IS
     # the profile running the guard — sibling-profile restarts are legitimate fleet operations and stay
     # allowed.
-    profile_match = _PROFILE_FLAG_LIFECYCLE_PATTERN.search(normalized)
-    if profile_match:
-        named = profile_match.group(1) or profile_match.group(2)
-        # Profile ids cannot contain quotes (`^[a-z0-9][a-z0-9_-]{0,63}$`), so a shell-quoted
-        # `-p 'zeus'` compares equal to the bare name.
-        if named and _named_profile_is_current(named.strip().strip("\"'")):
-            return True
+    # Fast keyword prefilter (#129281): Branch A2 requires hermes, gateway, and restart/stop.
+    lower_norm = normalized.lower()
+    if "gateway" in lower_norm and ("restart" in lower_norm or "stop" in lower_norm) and "hermes" in lower_norm:
+        profile_match = _PROFILE_FLAG_LIFECYCLE_PATTERN.search(normalized)
+        if profile_match:
+            named = profile_match.group(1) or profile_match.group(2)
+            # Profile ids cannot contain quotes (`^[a-z0-9][a-z0-9_-]{0,63}$`), so a shell-quoted
+            # `-p 'zeus'` compares equal to the bare name.
+            if named and _named_profile_is_current(named.strip().strip("\"'")):
+                return True
     # Token-aware pass. Tokens are also re-joined with Python argv-list punctuation stripped, since
     # `subprocess.run(["launchctl", "bootout", ...])` separates argv words with commas/brackets.
     # Token-aware second pass (#80269): re-run the pattern on shell-tokenized segments where quotes/escapes
