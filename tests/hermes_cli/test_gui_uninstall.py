@@ -113,3 +113,72 @@ def test_uninstall_args_namespace_mode_mapping():
     full = uninstall._UninstallArgs(mode="full")
     assert full.gui is False and full.full is True and full.yes is True
 
+
+def test_source_built_gui_artifacts_excludes_workspace_root_node_modules(tmp_path):
+    """The repo root is an npm workspace (apps/*, ui-tui, web, tests-js): its
+    node_modules serves every workspace, so a GUI uninstall must not list it."""
+    hermes_home = tmp_path / ".hermes"
+    agent_root = hermes_home / "hermes-agent"
+    artifacts = gu.source_built_gui_artifacts(hermes_home)
+    assert agent_root / "node_modules" not in artifacts
+    desktop_dir = agent_root / "apps" / "desktop"
+    assert desktop_dir / "dist" in artifacts
+    assert desktop_dir / "release" in artifacts
+    assert desktop_dir / "node_modules" in artifacts
+
+
+def test_uninstall_gui_leaves_workspace_root_node_modules_intact(tmp_path, monkeypatch):
+    """uninstall_gui removes the desktop workspace's own artifacts but leaves
+    the shared workspace-root node_modules (TUI/web/test deps) alone."""
+    hermes_home = tmp_path / ".hermes"
+    _make_agent(hermes_home)
+    _make_gui_build(hermes_home)
+    root_modules = hermes_home / "hermes-agent" / "node_modules"
+    desktop_modules = hermes_home / "hermes-agent" / "apps" / "desktop" / "node_modules"
+    monkeypatch.setattr(gu, "packaged_gui_app_paths", lambda: [])
+    monkeypatch.setattr(gu, "desktop_userdata_dir", lambda: tmp_path / "none")
+
+    removed = gu.uninstall_gui(hermes_home)
+
+    assert desktop_modules in removed and not desktop_modules.exists()
+    assert root_modules.exists()
+    assert root_modules not in removed
+
+
+def test_run_gui_uninstall_dry_run_neither_prompts_nor_deletes(tmp_path, monkeypatch, capsys):
+    """`hermes uninstall --gui --dry-run` prints the dry-run notice and exits
+    before prompting or deleting anything (regression: it used to wipe files)."""
+    import builtins
+
+    import hermes_cli.uninstall as uninstall
+
+    hermes_home = tmp_path / ".hermes"
+    _make_agent(hermes_home)
+    _make_gui_build(hermes_home)
+    gui_files = [
+        hermes_home / "hermes-agent" / "apps" / "desktop" / "dist" / "index.html",
+        hermes_home / "desktop-build-stamp.json",
+    ]
+    monkeypatch.setattr(uninstall, "get_hermes_home", lambda: hermes_home)
+    monkeypatch.setattr(uninstall, "_refuse_if_steward_owned", lambda: None)
+    monkeypatch.setattr(gu, "packaged_gui_app_paths", lambda: [])
+    monkeypatch.setattr(gu, "desktop_userdata_dir", lambda: tmp_path / "none")
+
+    def _fail_on_prompt(_text=""):
+        raise AssertionError("dry run must not prompt for confirmation")
+
+    def _fail_on_delete(_home, **_kwargs):
+        raise AssertionError("dry run must not delete GUI artifacts")
+
+    monkeypatch.setattr(builtins, "input", _fail_on_prompt)
+    monkeypatch.setattr(gu, "uninstall_gui", _fail_on_delete)
+
+    from types import SimpleNamespace
+
+    uninstall.run_gui_uninstall(SimpleNamespace(yes=False, dry_run=True))
+
+    out = capsys.readouterr().out
+    assert "Dry run: no files, services, or environment entries will be changed." in out
+    assert all(p.exists() for p in gui_files)
+    assert (hermes_home / "hermes-agent" / "node_modules").exists()
+

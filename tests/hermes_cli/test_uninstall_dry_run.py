@@ -1,7 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 
-from hermes_cli import uninstall
+from hermes_cli import main, uninstall
 
 
 def test_dry_run_prints_plan_without_mutating(monkeypatch, tmp_path, capsys):
@@ -68,3 +68,98 @@ def test_build_uninstall_parser_accepts_dry_run():
 
     assert args.dry_run is True
     assert args.full is True
+
+
+def test_gui_dry_run_skips_confirm_and_deletes_nothing(monkeypatch, tmp_path, capsys):
+    """`hermes uninstall --gui --dry-run` prints the dry-run notice and exits
+    before prompting or deleting anything (regression: it ignored --dry-run
+    and removed files)."""
+    import builtins
+
+    hermes_home = tmp_path / ".hermes"
+    agent_root = hermes_home / "hermes-agent"
+    desktop = agent_root / "apps" / "desktop"
+    (desktop / "dist").mkdir(parents=True)
+    (desktop / "dist" / "index.html").write_text("<html>")
+    (agent_root / "hermes_cli").mkdir(parents=True)
+
+    monkeypatch.setattr(uninstall, "get_hermes_home", lambda: hermes_home)
+    monkeypatch.setattr(uninstall, "_refuse_if_steward_owned", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.gui_uninstall.packaged_gui_app_paths", lambda: []
+    )
+    monkeypatch.setattr(
+        "hermes_cli.gui_uninstall.desktop_userdata_dir",
+        lambda: tmp_path / "absent-userdata",
+    )
+
+    def _fail_on_prompt(_text=""):
+        raise AssertionError("dry run must not prompt for confirmation")
+
+    def _fail_on_delete(_home, **_kwargs):
+        raise AssertionError("dry run must not delete GUI artifacts")
+
+    monkeypatch.setattr(builtins, "input", _fail_on_prompt)
+    monkeypatch.setattr("hermes_cli.gui_uninstall.uninstall_gui", _fail_on_delete)
+
+    uninstall.run_gui_uninstall(SimpleNamespace(yes=False, dry_run=True))
+
+    out = capsys.readouterr().out
+    assert "Dry run: no files, services, or environment entries will be changed." in out
+    assert (desktop / "dist" / "index.html").exists()
+
+
+def _non_tty_stdin(monkeypatch):
+    """Simulate a piped/non-interactive stdin for the TTY gate."""
+    import sys
+
+    class _FakeStdin:
+        def isatty(self):
+            return False
+
+    monkeypatch.setattr(sys, "stdin", _FakeStdin())
+
+
+def test_cmd_uninstall_gui_dry_run_without_tty_succeeds(monkeypatch):
+    """`hermes uninstall --gui --dry-run` through a pipe must not hit the TTY
+    gate — there is nothing to prompt for."""
+    import argparse
+
+    from hermes_cli.subcommands.uninstall import build_uninstall_parser
+
+    _non_tty_stdin(monkeypatch)
+    called = {}
+
+    def _fake_gui_uninstall(args):
+        called["args"] = args
+
+    monkeypatch.setattr(uninstall, "run_gui_uninstall", _fake_gui_uninstall)
+
+    parser = argparse.ArgumentParser()
+    build_uninstall_parser(parser.add_subparsers(dest="command"), cmd_uninstall=main.cmd_uninstall)
+    args = parser.parse_args(["uninstall", "--gui", "--dry-run"])
+    args.func(args)  # must not raise SystemExit from _require_tty
+
+    assert called["args"].dry_run is True
+
+
+def test_cmd_uninstall_default_dry_run_without_tty_succeeds(monkeypatch):
+    """`hermes uninstall --dry-run` through a pipe must not hit the TTY gate."""
+    import argparse
+
+    from hermes_cli.subcommands.uninstall import build_uninstall_parser
+
+    _non_tty_stdin(monkeypatch)
+    called = {}
+
+    def _fake_run_uninstall(args):
+        called["args"] = args
+
+    monkeypatch.setattr(uninstall, "run_uninstall", _fake_run_uninstall)
+
+    parser = argparse.ArgumentParser()
+    build_uninstall_parser(parser.add_subparsers(dest="command"), cmd_uninstall=main.cmd_uninstall)
+    args = parser.parse_args(["uninstall", "--dry-run"])
+    args.func(args)  # must not raise SystemExit from _require_tty
+
+    assert called["args"].dry_run is True
