@@ -58,7 +58,14 @@ def format_message(content: str) -> str:
     text = _INVISIBLE_RE.sub("", text)
     # Collapse double spaces left over from stripped chars.
     text = re.sub(r"  +", " ", text)
-    for key, value in placeholders.items():
+    # Restore outermost-first: a bold/header/link value may itself contain an
+    # earlier code-span key (e.g. **`key:`**), and insertion-order restore
+    # revives the inner key only while it is still hidden inside the outer
+    # value — when the outer placeholder is restored later, the inner key
+    # reappears with nothing left to replace it (#128985). A value can only
+    # reference earlier placeholders, so reversed insertion order restores
+    # every outer placeholder before the inner ones it contains.
+    for key, value in reversed(list(placeholders.items())):
         text = text.replace(key, value)
     return text
 

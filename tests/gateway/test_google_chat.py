@@ -1461,6 +1461,36 @@ class TestFormatMessage:
         out = GoogleChatAdapter.format_message("# Heading\nbody with # mid-line hash")
         assert out == "*Heading*\nbody with # mid-line hash"
 
+    def test_inline_code_inside_bold_keeps_code(self):
+        """**`key:`** → *`key:`*: the bold placeholder holds a code-span key,
+        so restore must run outermost-first or the inner key leaks (#128985)."""
+        out = GoogleChatAdapter.format_message("**`model:`** default model")
+        assert out == "*`model:`* default model"
+        assert "\x00" not in out
+
+    def test_inline_code_inside_header_keeps_code(self):
+        out = GoogleChatAdapter.format_message("## Using `hermes config`")
+        assert out == "*Using `hermes config`*"
+        assert "\x00" not in out
+
+    def test_inline_code_inside_link_text_keeps_code(self):
+        out = GoogleChatAdapter.format_message("[`code`](https://example.com)")
+        assert out == "<https://example.com|`code`>"
+        assert "\x00" not in out
+
+    def test_nested_link_bold_code_restores_all(self):
+        """Depth-2 nesting (link → bold → code) restores every level."""
+        out = GoogleChatAdapter.format_message("[**`a`**](https://example.com)")
+        assert out == "<https://example.com|*`a`*>"
+        assert "\x00" not in out
+
+    def test_never_leaks_placeholder_markers(self):
+        """No \\x00GCn\\x00 key survives, whatever the nesting."""
+        src = "**`model:`** default\n## Using `hermes config`\nplain `code` ok"
+        out = GoogleChatAdapter.format_message(src)
+        assert "\x00" not in out
+        assert "GC" not in out
+
 
     def test_strips_zwj_and_variation_selector(self):
         """ZWJ (U+200D) + Variation Selector 16 (U+FE0F) get stripped.
