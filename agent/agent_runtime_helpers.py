@@ -478,6 +478,26 @@ def _remember_absorbed_row(survivor: Dict[str, Any], dropped: Dict[str, Any], *,
         for row_id in ids:
             if row_id not in absorbed:
                 absorbed.append(row_id)
+    # Chain any id-less durable payload the dropped dict was already carrying.
+    stashed = []
+    for held in dropped.get("_absorbed_held") or ():
+        if isinstance(held, dict) and held not in stashed:
+            stashed.append(held)
+    if not ids and not stashed:
+        # An id-less dropped dict born durable still counts: stash a copy so the
+        # survivor names it for unresolved-held coverage.
+        if isinstance(dropped, dict):
+            try:
+                from agent.context_compressor import _DB_PERSISTED_MARKER
+            except Exception:
+                _DB_PERSISTED_MARKER = None
+            if _DB_PERSISTED_MARKER is not None and dropped.get(_DB_PERSISTED_MARKER):
+                stashed.append({k: v for k, v in dropped.items()})
+    if stashed:
+        bucket = survivor.setdefault("_absorbed_held", [])
+        for held in stashed:
+            if held not in bucket:
+                bucket.append(held)
     # The uid witness claims the dropped dict's TEXT lives on in the survivor: only a fold earns it. A
     # superseded row (``folded=False``) is retired like any absorbed row but its content is discarded.
     if folded:
@@ -521,6 +541,7 @@ def _drop_stray_tool_results(messages: List[Dict]) -> Tuple[List[Dict], int]:
     matched_tool_groups: set = set()
     next_tool_group = 0
     filtered: List[Dict] = []
+    pending_dropped: List[Dict] = []
     for msg in messages:
         role = msg.get("role") if isinstance(msg, dict) else None
         if role in ("assistant", "user"):
@@ -542,9 +563,21 @@ def _drop_stray_tool_results(messages: List[Dict]) -> Tuple[List[Dict], int]:
             }
             if result_variants and not candidate_groups:
                 repairs += 1
+                # The row stays active in state.db while reload drops it; retire
+                # its durable identity onto the survivor before it so archive
+                # coverage treats it as seen, not as a concurrent append to
+                # clone behind the running turn.
+                if filtered and isinstance(filtered[-1], dict):
+                    _remember_absorbed_row(filtered[-1], msg, folded=False)
+                else:
+                    pending_dropped.append(msg)
                 continue
             if candidate_groups:
                 matched_tool_groups.add(min(candidate_groups))
+        if isinstance(msg, dict) and pending_dropped:
+            for dropped in pending_dropped:
+                _remember_absorbed_row(msg, dropped, folded=False)
+            pending_dropped = []
         filtered.append(msg)
     return filtered, repairs
 
@@ -557,11 +590,16 @@ def _prune_unanswered_tool_calls(messages: List[Dict]) -> Tuple[List[Dict], int]
 
     repairs = 0
     pruned: List[Dict] = []
+    pending_dropped: List[Dict] = []
     for i, msg in enumerate(messages):
         if not (
             isinstance(msg, dict) and msg.get("role") == "assistant" and msg.get("tool_calls")
             and not _is_codex_interim(msg)
         ):
+            if isinstance(msg, dict) and pending_dropped:
+                for dropped in pending_dropped:
+                    _remember_absorbed_row(msg, dropped, folded=False)
+                pending_dropped = []
             pruned.append(msg)
             continue
         answered: set = set()
@@ -576,6 +614,13 @@ def _prune_unanswered_tool_calls(messages: List[Dict]) -> Tuple[List[Dict], int]
             repairs += 1
             if not kept_calls and not _msg_has_payload({k: v for k, v in msg.items() if k != "tool_calls"}):
                 # Pruned calls were the only payload; drop the turn (empty assistant messages 400).
+                # The killed turn's row stays active in state.db; retire it onto
+                # the survivor before it so archive coverage does not rewind
+                # and clone it behind the running turn.
+                if pruned and isinstance(pruned[-1], dict):
+                    _remember_absorbed_row(pruned[-1], msg, folded=False)
+                else:
+                    pending_dropped.append(msg)
                 continue
             if kept_calls:
                 msg["tool_calls"] = kept_calls
@@ -584,6 +629,10 @@ def _prune_unanswered_tool_calls(messages: List[Dict]) -> Tuple[List[Dict], int]
             # tool_calls is part of the persisted row; rewriting it on a stamped dict stales the
             # marker, so pop it or the flush scan skips the dict and the DB keeps the old calls.
             msg.pop(_DB_PERSISTED_MARKER, None)
+        if isinstance(msg, dict) and pending_dropped:
+            for dropped in pending_dropped:
+                _remember_absorbed_row(msg, dropped, folded=False)
+            pending_dropped = []
         pruned.append(msg)
     return pruned, repairs
 

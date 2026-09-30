@@ -11,6 +11,11 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 ABSORBED_ROW_IDS = "_absorbed_row_ids"
+# Id-less durable payload a repair folded into a survivor: copies of dropped
+# dicts born durable (persist marker) but carrying no ``_row_id`` (gateway/ACP
+# reloads). Surfaced as unresolved held coverage so the commit archives the
+# originals instead of cloning them behind the running turn.
+ABSORBED_HELD = "_absorbed_held"
 
 
 def _positive_id(value: Any) -> Optional[int]:
@@ -27,7 +32,9 @@ def held_archive_coverage(
     A positive ``_row_id`` is covered, including ids a repair merged into that dict.
     A dict with no id is unresolved: the commit matches one durable row, and a
     marker-less miss is an unpersisted turn rather than a reason to archive the
-    lease watermark.
+    lease watermark. Id-less durable payload a repair stashed on
+    ``_absorbed_held`` counts as unresolved too, so a dropped stray result or a
+    killed tool-call turn is archived, not cloned behind the running turn.
     """
     covered: List[int] = []
     unresolved: List[Dict[str, Any]] = []
@@ -44,6 +51,9 @@ def held_archive_coverage(
                 absorbed_id = _positive_id(absorbed)
                 if absorbed_id is not None:
                     covered.append(absorbed_id)
+            for held in message.get(ABSORBED_HELD) or ():
+                if isinstance(held, dict):
+                    unresolved.append(held)
     return list(dict.fromkeys(covered)), unresolved
 
 
