@@ -1112,6 +1112,13 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str], *, host: b
                     respawn_env_overlay=dict(respawn_env_overlay),
                     watcher_env=_handoff_watcher_env,
                 ):
+                    # Accepted submission, not a proven surviving handoff:
+                    # survival is proven only by the later liveness poll
+                    # (_verify_relaunched_gateways_alive / _wait_for_gateway_ready).
+                    logger.debug(
+                        "transient task handoff accepted (schtasks /Run); "
+                        "survival to be verified by liveness poll"
+                    )
                     return True
             except Exception as exc:
                 try:
@@ -1121,13 +1128,18 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str], *, host: b
                     _log_path.parent.mkdir(parents=True, exist_ok=True)
                     with open(_log_path, "ab") as _fh:
                         _fh.write(
-                            f"transient task handoff failed ({exc}); falling back to breakaway watcher\n".encode(
+                            f"transient task handoff failed ({exc}); falling back to breakaway watcher "
+                            f"(best-effort fallback: may not survive kill-on-close jobs if breakaway is denied)\n".encode(
                                 "utf-8", errors="replace"
                             )
                         )
                 except Exception:
                     pass
-                logger.debug("transient task handoff failed, falling back to watcher: %s", exc)
+                logger.warning(
+                    "transient task handoff failed, falling back to best-effort breakaway watcher "
+                    "(may not survive kill-on-close jobs if breakaway is denied): %s",
+                    exc,
+                )
 
     # cwd/env overlay are embedded as JSON literals in the watcher source (no extra argv plumbing).
     watcher = textwrap.dedent(

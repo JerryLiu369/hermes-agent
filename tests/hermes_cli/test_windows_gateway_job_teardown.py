@@ -167,7 +167,7 @@ class TestProcessIsInJob:
 # 4. Transient task template/behavior (#127089)
 # ---------------------------------------------------------------------------
 
-def _launcher_kwargs(task_name="Hermes_GW_Restart_1_abcd1234", temp_dir=r"C:\Temp\hermes-gw-restart-x"):
+def _launcher_kwargs(task_name="Hermes_GW_Restart_1_abcd1234", temp_dir=r"C:\Temp\hermes-gw-restart-x", watcher_env=None):
     return dict(
         task_name=task_name,
         temp_dir=temp_dir,
@@ -175,7 +175,7 @@ def _launcher_kwargs(task_name="Hermes_GW_Restart_1_abcd1234", temp_dir=r"C:\Tem
         gateway_cmd=["C:\\venv\\Scripts\\python.exe", "-m", "hermes_cli.main", "gateway", "run"],
         respawn_cwd=r"C:\Users\me\.hermes",
         respawn_env_overlay={"HERMES_HOME": r"C:\Users\me\.hermes", "VIRTUAL_ENV": r"C:\venv"},
-        watcher_env=None,
+        watcher_env=watcher_env,
         project_root=r"C:\hermes\hermes-agent",
         watcher_timeout_s=120.0,
     )
@@ -443,3 +443,193 @@ class TestRestartWatcherJobHandoff:
 def test_process_is_in_job_live_returns_bool():
     """Native probe smoke: returns a bool on a real Windows host."""
     assert isinstance(_subprocess_compat.process_is_in_job(), bool)
+
+
+# ---------------------------------------------------------------------------
+# 6. Nullable watcher_env launcher execution (#127089 review)
+# ---------------------------------------------------------------------------
+
+class TestNullableWatcherEnvExecution:
+    def test_none_renders_python_none_literal(self):
+        """A named profile passes host=False so watcher_env=None: the
+        launcher must render Python-safe ``None``, not JSON ``null``
+        (``null`` compiles but raises NameError before _delete_task)."""
+        src = gateway_windows._build_transient_task_launcher(**_launcher_kwargs(watcher_env=None))
+        assignment = next(
+            line for line in src.splitlines() if line.strip().startswith("_WATCHER_ENV =")
+        )
+        assert assignment.strip() == "_WATCHER_ENV = None"
+        assert "null" not in assignment
+        # The literal itself evaluates cleanly to None (no NameError).
+        namespace: dict = {}
+        exec(assignment, namespace)  # noqa: S102 — intentional literal check
+        assert namespace["_WATCHER_ENV"] is None
+
+    def test_dict_watcher_env_roundtrips(self):
+        """Host handoff supplies a dict: it still renders and evaluates."""
+        env = {"HERMES_HOME": r"C:\Users\me\.hermes", "A": "1"}
+        src = gateway_windows._build_transient_task_launcher(
+            **_launcher_kwargs(watcher_env=env)
+        )
+        assignment = next(
+            line for line in src.splitlines() if line.strip().startswith("_WATCHER_ENV =")
+        )
+        namespace: dict = {}
+        exec(assignment, namespace)  # noqa: S102 — intentional literal check
+        assert namespace["_WATCHER_ENV"] == env
+
+    def test_none_launcher_executes_without_nameerror(self, monkeypatch, tmp_path):
+        """Behavioral: the full None-path launcher executes past _WATCHER_ENV
+        (no NameError), respawns once, and cleans its temp dir in finally."""
+        import subprocess as _sp
+
+        import hermes_constants
+
+        temp_dir = tmp_path / "launcher-tmp"
+        temp_dir.mkdir()
+        (temp_dir / "dummy.txt").write_text("x", encoding="utf-8")
+        src = gateway_windows._build_transient_task_launcher(
+            task_name="Hermes_GW_Restart_1_abcd1234",
+            temp_dir=str(temp_dir),
+            old_pid=999999,  # provably dead: wait loop exits immediately
+            gateway_cmd=[sys.executable, "-c", "pass"],
+            respawn_cwd="",
+            respawn_env_overlay={},
+            watcher_env=None,
+            project_root=str(Path(gateway_windows.__file__).resolve().parent.parent),
+            watcher_timeout_s=5.0,
+        )
+        assert "_WATCHER_ENV = None" in src
+        compile(src, "<transient_launcher_none>", "exec")
+
+        popen_calls: list = []
+        run_calls: list = []
+
+        def fake_popen(*args, **kwargs):
+            popen_calls.append((args, kwargs))
+
+            class _P:
+                pid = 1111
+
+            return _P()
+
+        def fake_run(*args, **kwargs):
+            run_calls.append((args, kwargs))
+
+            class _R:
+                returncode = 0
+
+            return _R()
+
+        monkeypatch.setattr(_sp, "Popen", fake_popen)
+        monkeypatch.setattr(_sp, "run", fake_run)
+        monkeypatch.setattr(_subprocess_compat, "pid_exists_stdlib", lambda pid: False)
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: str(tmp_path))
+        try:
+            exec(compile(src, "<transient_launcher_none>", "exec"), {"__name__": "__launcher__"})  # noqa: S102
+        except NameError as exc:
+            pytest.fail(f"None-path launcher raised NameError: {exc}")
+        # Respawn attempted once; task delete attempted early + finally.
+        assert len(popen_calls) == 1
+        assert len(run_calls) >= 2
+        assert any("/Delete" in str(call) for call in run_calls)
+        # finally removed the temp dir.
+        assert not temp_dir.exists()
+
+
+# ---------------------------------------------------------------------------
+# 7. Scheduler rejection log/warning distinction (#127089 review)
+# ---------------------------------------------------------------------------
+
+class TestSchedulerRejectionDiagnostics:
+    def test_rejected_handoff_warns_best_effort(self, monkeypatch, tmp_path, caplog):
+        """A rejected scheduler handoff falls back to a best-effort in-job
+        watcher: the file log keeps the existing diagnostics plus the
+        kill-on-close/breakaway warning, and the logger warns (not debug)."""
+        import logging
+
+        import hermes_constants
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(_subprocess_compat, "process_is_in_job", lambda: True)
+        monkeypatch.setattr(
+            gateway_windows, "windowless_gateway_restart_spec",
+            lambda argv: (argv, "", {}),
+        )
+
+        def failing_transient(*a, **k):
+            raise RuntimeError("schtasks /Run failed (code 1): No valid logon token.")
+
+        monkeypatch.setattr(gateway_windows, "_spawn_gateway_via_transient_task", failing_transient)
+        calls: list = []
+        monkeypatch.setattr(gateway.subprocess, "Popen", _fake_popen_factory(calls))
+        monkeypatch.setattr(hermes_constants, "get_hermes_home", lambda: str(tmp_path))
+        with caplog.at_level(logging.WARNING, logger="hermes_cli.gateway"):
+            assert gateway._spawn_gateway_restart_watcher(555, ["python", "gateway"], host=False) is True
+        assert len(calls) == 1
+        log_path = tmp_path / "logs" / "gateway-stdio.log"
+        assert log_path.exists()
+        text = log_path.read_text(encoding="utf-8", errors="replace")
+        # Existing diagnostics intact.
+        assert "transient task handoff failed" in text
+        assert "falling back" in text
+        # Refined best-effort fallback warning.
+        assert "best-effort" in text
+        assert "breakaway" in text
+        assert "kill-on-close" in text or "may not survive" in text
+        warnings = [
+            r for r in caplog.records
+            if r.name == "hermes_cli.gateway" and r.levelno >= logging.WARNING
+        ]
+        assert warnings, "expected a logger.warning for the rejected handoff fallback"
+        warned = " ".join(r.getMessage() for r in warnings)
+        assert "transient task handoff failed" in warned
+        assert "best-effort" in warned
+        assert "breakaway" in warned
+
+    def test_accepted_handoff_marks_submission_not_proven(self, monkeypatch, caplog):
+        """An accepted schtasks /Run is a submission, not a proven surviving
+        handoff: success is logged as accepted pending the liveness poll."""
+        import logging
+
+        monkeypatch.setattr(sys, "platform", "win32")
+        monkeypatch.setattr(_subprocess_compat, "process_is_in_job", lambda: True)
+        monkeypatch.setattr(
+            gateway_windows, "windowless_gateway_restart_spec",
+            lambda argv: (argv, "", {}),
+        )
+        monkeypatch.setattr(
+            gateway_windows, "_spawn_gateway_via_transient_task", lambda *a, **k: True,
+        )
+        calls: list = []
+        monkeypatch.setattr(gateway.subprocess, "Popen", _fake_popen_factory(calls))
+        with caplog.at_level(logging.DEBUG, logger="hermes_cli.gateway"):
+            assert gateway._spawn_gateway_restart_watcher(666, ["python", "gateway"], host=False) is True
+        assert calls == []
+        messages = " ".join(r.getMessage() for r in caplog.records if r.name == "hermes_cli.gateway")
+        assert "accepted" in messages
+        assert "liveness poll" in messages or "to be verified" in messages
+
+
+# ---------------------------------------------------------------------------
+# 8. Launcher cleanup paths (#127089 review)
+# ---------------------------------------------------------------------------
+
+class TestLauncherCleanupContract:
+    def test_launcher_preserves_early_and_final_cleanup(self):
+        """Early _delete_task (no orphan on kill during wait), final
+        _delete_task + temp cleanup, and the stdio/breakaway diagnostics
+        all survive the nullable-literal fix."""
+        src = gateway_windows._build_transient_task_launcher(**_launcher_kwargs())
+        assert "gateway-stdio.log" in src
+        assert "_HERMES_GATEWAY_BREAKAWAY" in src
+        assert "shutil.rmtree" in src
+        # Early delete before the wait loop.
+        early = src.index("_delete_task()\ntry:")
+        assert early >= 0
+        # Final cleanup deletes the task and the temp dir.
+        final = src.rindex("finally:")
+        tail = src[final:]
+        assert "_delete_task()" in tail
+        assert "_cleanup_temp()" in tail
+        assert "_TEMP_DIR" in src

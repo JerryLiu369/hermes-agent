@@ -881,7 +881,9 @@ def _build_transient_task_launcher(
     stdio to ``logs/gateway-stdio.log`` with the canonical
     ``_HERMES_GATEWAY_BREAKAWAY`` stamp, and removes ``temp_dir`` in
     ``finally``. Pure string rendering so it is testable off-Windows; the
-    caller embeds values as JSON literals.
+    caller embeds values as JSON literals, except ``watcher_env`` which uses
+    a Python-safe nullable literal (``None`` when unset — ``json.dumps(None)``
+    would render ``null`` and raise ``NameError`` at runtime, #127089).
     """
     return textwrap.dedent(
         """
@@ -992,7 +994,10 @@ def _build_transient_task_launcher(
         gateway_cmd_literal=json.dumps(list(gateway_cmd)),
         respawn_cwd_literal=json.dumps(respawn_cwd),
         respawn_env_literal=json.dumps(dict(respawn_env_overlay or {})),
-        watcher_env_literal=json.dumps(watcher_env),
+        # Nullable: ``json.dumps(None)`` is ``null`` (NameError in Python);
+        # a named profile passes ``watcher_env=None`` (host=False), so render
+        # the Python-safe ``None`` literal instead.
+        watcher_env_literal="None" if watcher_env is None else json.dumps(watcher_env),
         timeout_literal=json.dumps(float(watcher_timeout_s)),
     )
 
@@ -1019,8 +1024,11 @@ def _spawn_gateway_via_transient_task(
     interactive logon token in SSH/service sessions, timeout): the caller MUST
     fall back to the existing breakaway -> non-breakaway Popen chain rather
     than failing the restart. Never returns False on success; returns True
-    once ``schtasks /Run`` is accepted (the launcher + verification poll own
-    the rest).
+    once ``schtasks /Run`` is accepted. An accepted submission is not a proven
+    surviving handoff — survival is proven only by the later liveness poll
+    (``_wait_for_gateway_ready``); the in-job Popen fallback after a rejected
+    handoff is best-effort and may not survive kill-on-close jobs if breakaway
+    is denied.
     """
     _assert_windows()
     if old_pid <= 0 or not run_argv:
