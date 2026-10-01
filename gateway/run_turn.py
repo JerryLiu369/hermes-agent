@@ -2370,7 +2370,11 @@ class GatewayTurnMixin:
                         ch.provider, target_model=model or None)
                 except Exception:
                     logger.debug("Channel-override provider unavailable for display", exc_info=True)
-                    rt = None
+                    # Fall back model and route together: keeping the override
+                    # model with route=None would pair it with the global
+                    # provider in _resolve_gateway_model_context(), an unusable
+                    # route the turn itself cannot run.
+                    return None, None
                 if rt:
                     bundled = rt.get("model")
                     if bundled and not model:
@@ -2378,6 +2382,9 @@ class GatewayTurnMixin:
                     route = {k: rt.get(k) for k in ("provider", "base_url", "api_key") if rt.get(k)}
                     if not route:
                         route = None
+                if route is None:
+                    # Provider pinned but no usable endpoint: same fallback.
+                    return None, None
             if model is None and route is None:
                 return None, None
             return model, route

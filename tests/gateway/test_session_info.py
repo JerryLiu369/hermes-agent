@@ -218,7 +218,13 @@ class TestSessionRouteForSource:
         source = SessionSource(platform=Platform.TELEGRAM, chat_id="lane1", user_id="u1")
         assert runner._session_route_for_source(source) == (None, None)
 
-    def test_broken_provider_degrades_to_model_without_raising(self, runner):
+    def test_broken_provider_falls_back_to_global_without_raising(self, runner):
+        """Broken channel provider falls back model and route together.
+
+        Keeping the override model with route=None would pair it with the
+        global provider in _resolve_gateway_model_context() (e.g.
+        claude-sonnet with anthropic) — an unusable route the turn cannot run.
+        """
         from gateway.config import ChannelOverride
         self._runner_with_override(
             runner, {"lane1": ChannelOverride(model="lane-model", provider="bogus-provider")})
@@ -228,8 +234,7 @@ class TestSessionRouteForSource:
         with patch("gateway.run._resolve_runtime_agent_kwargs_for_provider",
                    side_effect=RuntimeError("no such provider")):
             model, route = runner._session_route_for_source(source)
-        assert model == "lane-model"
-        assert route is None
+        assert (model, route) == (None, None)
 
     def test_no_config_or_source_never_raises(self, runner):
         runner.config = None
@@ -308,8 +313,26 @@ class TestFormatSessionInfoChannelOverrides:
              patch("gateway.run._resolve_runtime_agent_kwargs_for_provider",
                    side_effect=RuntimeError("bad provider")):
             info = runner._format_session_info(self._source())
-        # Broken endpoint must not break /new: lane model still shown, banner still renders.
-        assert "lane-model" in info or "global-model" in info
+        # Broken lane falls back model and route together: exact global pairing.
+        assert "global-model" in info
+        assert "anthropic" in info
+        assert "lane-model" not in info
+
+    def test_broken_claude_sonnet_override_reports_global_pairing(self, runner, tmp_path):
+        """Reviewer repro: claude-sonnet lane + anthropic global must not mix."""
+        from gateway.config import ChannelOverride
+        self._runner(
+            runner, {"lane1": ChannelOverride(model="claude-sonnet", provider="bogus-lane")})
+        cfg_path = tmp_path / "config.yaml"
+        cfg_path.write_text("model:\n  default: global-model\n  provider: anthropic\n")
+        with patch("gateway.run._hermes_home", tmp_path), \
+             patch("gateway.run._resolve_runtime_agent_kwargs", return_value=dict(self._GLOBAL_RUNTIME)), \
+             patch("gateway.run._resolve_runtime_agent_kwargs_for_provider",
+                   side_effect=RuntimeError("bad provider")):
+            info = runner._format_session_info(self._source())
+        assert "global-model" in info
+        assert "anthropic" in info
+        assert "claude-sonnet" not in info
 
     def test_reset_notice_forwards_source(self, runner, tmp_path):
         """_reset_notice_session_info passes its source so the /new banner sees the lane."""
