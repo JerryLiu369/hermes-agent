@@ -124,6 +124,34 @@ class TestDirectProfileVerification:
 
         assert token["profiles"] == {"default": 999999}
 
+    def test_one_fleet_hit_does_not_vouch_for_two_missing_profiles(self, verify_stubs):
+        """kvnloo review: one scope-filtered hit cannot vouch for two record-less profiles.
+
+        A has no PID file and is alive (the lone fleet hit), B has no PID file and is
+        dead — B must still fail instead of riding A's hit.
+        """
+        verify_stubs["ready"] = [4242]
+        profiles = {"a": 1111, "b": 2222}
+        token = _profile_token(profiles=dict(profiles))
+        # Neither home has a gateway.pid (slow/missing write for A, dead gateway for B).
+
+        with pytest.raises(RuntimeError, match="not verified alive"):
+            uw._verify_relaunched_gateways_alive(token, profiles, [])
+
+        missing = uw._missing_relaunched_gateways(token, profiles, [], {4242}, {})
+        assert any("'b'" in entry for entry in missing)
+        assert verify_stubs["attested"] == []
+
+    def test_two_fleet_hits_vouch_for_two_missing_profiles(self, verify_stubs):
+        """Enough distinct fleet processes cover every record-less profile (slow boot)."""
+        verify_stubs["ready"] = [4242, 4243]
+        profiles = {"a": 1111, "b": 2222}
+        token = _profile_token(profiles=dict(profiles))
+
+        uw._verify_relaunched_gateways_alive(token, profiles, [])
+
+        assert verify_stubs["attested"] == [([4242, 4243], "post-update relaunch")]
+
 
 class TestServiceVerification:
     @staticmethod

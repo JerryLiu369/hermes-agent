@@ -1340,18 +1340,36 @@ def _missing_relaunched_gateways(
     """Names of expected gateways with no liveness evidence; ``[]`` = the relaunch is verified.
 
     A mapped profile/service is covered by a live PID file, or — when it holds no record (slow
-    boot, stubbed probe) — by a non-empty scope-filtered fleet poll. A PID file naming a dead
-    process is positive proof of death: a fleet hit is then somebody else's gateway, never ours
-    (#126076 false pass). Restarted services additionally fail on a readable non-``running``
-    SCM status. Unmapped relaunches (no PID file) are covered by either fleet scan.
+    boot, stubbed probe) — by enough distinct scope-filtered fleet processes to cover EVERY
+    such record-less profile (one fleet process vouches for at most one profile: a single
+    hit cannot vouch for two missing files, and a live sibling's PID cannot vouch for a
+    missing one). A PID file naming a dead process is positive proof of death: a fleet hit
+    is then somebody else's gateway, never ours (#126076 false pass). Restarted services
+    additionally fail on a readable non-``running`` SCM status. Unmapped relaunches (no PID
+    file) are covered by either fleet scan.
     """
     missing: list[str] = []
     service_profile_names = _expected_service_profile_names(token)
     expected = sorted(set(map(str, profiles or {})) | set(service_profile_names))
+    records: dict[str, tuple[int | None, int | None]] = {}
+    live_pids: set[int] = set()
     for name in expected:
         home = _profile_home_for_verify(name)
         recorded, live = (None, None) if home is None else _recorded_profile_pids(home)
-        if live or (recorded is None and ready_pids):
+        records[name] = (recorded, live)
+        if live:
+            with suppress(Exception):
+                live_pids.add(int(live))
+    unclaimed: set[int] = set()
+    for pid in ready_pids or set():
+        with suppress(Exception):
+            if int(pid) > 0 and int(pid) not in live_pids:
+                unclaimed.add(int(pid))
+    missing_file_count = sum(1 for name in expected if records[name][1] is None and records[name][0] is None)
+    fleet_covers_missing = missing_file_count > 0 and len(unclaimed) >= missing_file_count
+    for name in expected:
+        recorded, live = records[name]
+        if live or (recorded is None and fleet_covers_missing):
             continue
         if name in service_profile_names:
             missing.append(f"service {service_profile_names[name]!r} gateway (profile {name!r}) is not alive")
