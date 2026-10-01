@@ -94,7 +94,9 @@ def _has_pytest_ancestor() -> bool:
     ``_running_under_pytest`` reads ``PYTEST_*`` env vars, which a child spawned with a rebuilt environment
     loses at the same moment it loses the ``HERMES_HOME`` redirect: that child aims at the production DB
     *and* disarms the guard in one step (#82770). Ancestry is the one test-context signal that survives an
-    env rebuild, so it backs the env check up.
+    env rebuild, so it backs the env check up. A walk that raises is still fail-open for this call, but
+    that ``False`` is not memoized: a transient ``psutil`` error must not disarm the guard for the
+    rest of the process (#126766).
     """
     global _PYTEST_ANCESTOR
     if _PYTEST_ANCESTOR is not None:
@@ -104,7 +106,7 @@ def _has_pytest_ancestor() -> bool:
         try:
             found = any(_process_looks_like_pytest(p) for p in psutil.Process().parents())
         except Exception:
-            found = False
+            return False
     _PYTEST_ANCESTOR = found
     return found
 
