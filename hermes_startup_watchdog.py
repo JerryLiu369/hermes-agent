@@ -482,6 +482,30 @@ def _with_armed_handle(method: str, failure_msg: str, *args) -> None:
         logger.debug(failure_msg, exc_info=True)
 
 
+def startup_watchdog_lease_active() -> tuple[bool, str, float]:
+    """Whether the armed watchdog holds a live progress lease (never raises).
+
+    Returns ``(active, phase, remaining_s)``. A live lease means a startup phase
+    is doing legitimately long synchronous I/O (e.g. ``state_db`` integrity
+    check/repair) and the system is known to be saturated — callers measuring
+    fixed wall-clock deadlines (plugin loads) should extend their budget rather
+    than treat slowness as a hang (#126356).
+    """
+    try:
+        with _handle_lock:
+            handle = _handle
+        if handle is None:
+            return (False, "", 0.0)
+        with handle._state_lock:
+            remaining = handle._lease_until - time.monotonic()
+            phase = handle._lease_phase or ""
+        if remaining > 0:
+            return (True, phase, remaining)
+        return (False, phase, 0.0)
+    except Exception:
+        return (False, "", 0.0)
+
+
 def kick_startup_watchdog(extra_s: float = 0.0) -> None:
     """Extend the armed watchdog's deadline. No-op when not armed; never raises.
 
