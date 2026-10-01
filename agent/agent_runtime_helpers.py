@@ -20,7 +20,8 @@ from agent.message_sanitization import (
     _FULL_ARGS_LOG_BOUND, coalesce_tool_call_id, coerce_tool_name, tool_call_id_variants, tool_result_id_variants
 )
 from agent.message_metadata import (
-    TOOL_CALL_UIDS, merge_tool_call_uids, per_occurrence_tool_call_uids, record_absorbed_message)
+    ABSORBED_HELD, ABSORBED_ROW_IDS, TOOL_CALL_UIDS, merge_tool_call_uids, per_occurrence_tool_call_uids,
+    record_absorbed_message)
 from agent.prompt_builder import STEER_DISPLAY_KIND, steer_user_row
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.think_scrubber import THINK_TAG_NAMES
@@ -470,31 +471,38 @@ def _remember_absorbed_row(survivor: Dict[str, Any], dropped: Dict[str, Any], *,
     row_id = dropped.get("_row_id")
     if isinstance(row_id, int) and not isinstance(row_id, bool) and row_id > 0:
         ids.append(row_id)
-    for older in dropped.get("_absorbed_row_ids") or ():
+    for older in dropped.get(ABSORBED_ROW_IDS) or ():
         if isinstance(older, int) and not isinstance(older, bool) and older > 0 and older not in ids:
             ids.append(older)
     if ids:
-        absorbed = survivor.setdefault("_absorbed_row_ids", [])
+        absorbed = survivor.setdefault(ABSORBED_ROW_IDS, [])
         for row_id in ids:
             if row_id not in absorbed:
                 absorbed.append(row_id)
-    # Chain any id-less durable payload the dropped dict was already carrying.
+    # Chain any id-less durable identity the dropped dict was already carrying.
     stashed = []
-    for held in dropped.get("_absorbed_held") or ():
+    for held in dropped.get(ABSORBED_HELD) or ():
         if isinstance(held, dict) and held not in stashed:
             stashed.append(held)
     if not ids and not stashed:
-        # An id-less dropped dict born durable still counts: stash a copy so the
-        # survivor names it for unresolved-held coverage.
+        # An id-less dropped dict born durable still counts: stash its identity
+        # (role + content for the in-txn match, marker for the durable check)
+        # so the survivor names it for unresolved-held coverage. Identity only:
+        # the full dict copy would ride inside the wire shadow the token
+        # estimator prices, charging repair bookkeeping to the compaction budget.
         if isinstance(dropped, dict):
             try:
                 from agent.context_compressor import _DB_PERSISTED_MARKER
             except Exception:
                 _DB_PERSISTED_MARKER = None
             if _DB_PERSISTED_MARKER is not None and dropped.get(_DB_PERSISTED_MARKER):
-                stashed.append({k: v for k, v in dropped.items()})
+                stashed.append({
+                    "role": dropped.get("role"),
+                    "content": dropped.get("content"),
+                    _DB_PERSISTED_MARKER: True,
+                })
     if stashed:
-        bucket = survivor.setdefault("_absorbed_held", [])
+        bucket = survivor.setdefault(ABSORBED_HELD, [])
         for held in stashed:
             if held not in bucket:
                 bucket.append(held)

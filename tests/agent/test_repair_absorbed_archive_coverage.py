@@ -137,3 +137,40 @@ def test_id_less_path_archives_repair_dropped_rows(db: SessionDB) -> None:
         assert len(matches) == 1 and matches[0]["active"] == 0 and matches[0]["compacted"] == 1, (
             f"dropped row {content!r} must be archived once as summarized history: {matches}"
         )
+
+
+def test_absorbed_held_is_persistence_only_and_identity_minimal() -> None:
+    """Verify _absorbed_held is excluded from wire shadow / token pricing and stashes identity only."""
+    from agent.agent_runtime_helpers import _remember_absorbed_row
+    from agent.context_compressor import _DB_PERSISTED_MARKER
+    from agent.message_metadata import (
+        ABSORBED_HELD,
+        ABSORBED_ROW_IDS,
+        PERSISTENCE_ONLY_MESSAGE_FIELDS,
+        without_persistence_fields,
+    )
+
+    assert ABSORBED_ROW_IDS in PERSISTENCE_ONLY_MESSAGE_FIELDS
+    assert ABSORBED_HELD in PERSISTENCE_ONLY_MESSAGE_FIELDS
+
+    survivor = {"role": "assistant", "content": "survivor"}
+    dropped = {
+        "role": "tool",
+        "content": "heavy payload" * 100,
+        "tool_call_id": "call_123",        "extra_bloat": "x" * 1000,
+        _DB_PERSISTED_MARKER: True,
+    }
+    _remember_absorbed_row(survivor, dropped, folded=False)
+
+    assert ABSORBED_HELD in survivor
+    assert len(survivor[ABSORBED_HELD]) == 1
+    stashed = survivor[ABSORBED_HELD][0]
+    assert stashed.get("role") == "tool"
+    assert stashed.get("content") == dropped["content"]
+    assert stashed.get(_DB_PERSISTED_MARKER) is True
+    assert "extra_bloat" not in stashed
+    assert "tool_call_id" not in stashed
+
+    clean = without_persistence_fields(survivor)
+    assert ABSORBED_HELD not in clean
+    assert ABSORBED_ROW_IDS not in clean

@@ -10,12 +10,10 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-ABSORBED_ROW_IDS = "_absorbed_row_ids"
-# Id-less durable payload a repair folded into a survivor: copies of dropped
-# dicts born durable (persist marker) but carrying no ``_row_id`` (gateway/ACP
-# reloads). Surfaced as unresolved held coverage so the commit archives the
-# originals instead of cloning them behind the running turn.
-ABSORBED_HELD = "_absorbed_held"
+from agent.message_metadata import ABSORBED_HELD, ABSORBED_ROW_IDS
+
+# Re-exported for callers importing from this module.
+__all__ = ["ABSORBED_ROW_IDS", "ABSORBED_HELD", "held_archive_coverage", "newest_exact_held_id", "coverage_for_commit"]
 
 
 def _positive_id(value: Any) -> Optional[int]:
