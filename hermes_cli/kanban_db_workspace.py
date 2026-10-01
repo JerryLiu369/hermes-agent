@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING
 import contextlib
 
 from hermes_cli.worktree_ops import release_lsp_clients
+from hermes_cli._subprocess_compat import harden_git_argv, noninteractive_git_env
 
 if TYPE_CHECKING:
     from hermes_cli.kanban_db import Task
@@ -50,13 +51,20 @@ _WORKSPACE_ROW_SQL = "SELECT workspace_kind, workspace_path, branch_name FROM ta
 
 
 def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProcess:
-    """``git -C repo_root args``; never raises on a non-zero exit."""
+    """``git -C repo_root args``; never raises on a non-zero exit.
+
+    Hardened against a malicious repo's ``.git/config`` (GHSA-7x36-8jrh-v4pw):
+    ``noninteractive_git_env`` disables fsmonitor/hooks/pager/editor/credential
+    sinks (``worktree add`` runs hooks and reads the index).
+    """
     return subprocess.run(
-        ["git", "-C", str(repo_root), *args],
+        ["git", "-C", str(repo_root), *harden_git_argv(list(args))],
         capture_output=True,
         text=True, encoding='utf-8', errors='replace',
         timeout=timeout,
         check=False,
+        stdin=subprocess.DEVNULL,
+        env=noninteractive_git_env(),
     )
 
 

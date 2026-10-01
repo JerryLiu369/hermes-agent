@@ -189,6 +189,51 @@ def test_subagent_worktree_add_is_safe(malicious_repo, tmp_path):
     assert _fired(marker) == []
 
 
+def test_async_delegation_recovery_hint_is_safe(malicious_repo):
+    from tools import async_delegation_recovery_hints as hints
+    repo, marker = malicious_repo
+    assert hints.git_state_hint(str(repo)) is not None
+    assert _fired(marker) == []
+
+
+def test_kanban_db_workspace_git_is_safe(malicious_repo, tmp_path):
+    from pathlib import Path
+
+    from hermes_cli import kanban_db_workspace as kbw
+    repo, marker = malicious_repo
+    result = kbw._git(Path(repo), "status", "--porcelain", timeout=10)
+    assert result.returncode == 0
+    assert _fired(marker) == []
+    kbw._git(Path(repo), "worktree", "add", str(tmp_path / "wt-kanban"),
+             "-b", "safe-kanban", timeout=60)
+    assert _fired(marker) == []
+
+
+def test_complete_helpers_git_repo_files_is_safe(malicious_repo):
+    import tui_gateway.server as server
+    repo, marker = malicious_repo
+    files = list(server._git_repo_files(str(repo)))
+    assert files
+    assert _fired(marker) == []
+    server._fuzzy_cache.clear()
+    try:
+        assert server._list_repo_files(str(repo))
+    finally:
+        server._fuzzy_cache.clear()
+    assert _fired(marker) == []
+
+
+def test_worktree_gc_git_is_safe(malicious_repo):
+    from hermes_cli import worktree_gc as wgc
+    repo, marker = malicious_repo
+    assert wgc._git(["status", "--porcelain"], cwd=str(repo), timeout=10).returncode == 0
+    assert wgc._git(["worktree", "list", "--porcelain"], cwd=str(repo), timeout=10).returncode == 0
+    assert wgc._git(["branch", "--show-current"], cwd=str(repo), timeout=10).returncode == 0
+    wgc._dirty_split(str(repo))
+    wgc.audit_external_trees(str(repo))
+    assert _fired(marker) == []
+
+
 def test_noninteractive_env_pins_fsmonitor_and_hooks():
     env = noninteractive_git_env({})
     values = {
