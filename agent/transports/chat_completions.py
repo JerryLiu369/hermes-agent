@@ -33,10 +33,13 @@ from agent.transports.types import NormalizedResponse, ToolCall, Usage
 _XAI_TOOL_SEARCH_ALIAS = "hermes_tool_search"
 
 # Persistence-only / cross-transport message keys that strict OpenAI-compatible
-# providers reject with HTTP 400 ("Extra inputs are not permitted").
+# providers reject with HTTP 400/422 ("Extra inputs are not permitted" / "extra_forbidden",
+# e.g. Mistral on ``reasoning_details`` — #130757). ``reasoning`` is trajectory-only
+# (replayed as ``reasoning_content`` for thinking models); it never belongs on the wire.
 _STRIP_MSG_KEYS = (
     "codex_reasoning_items", "codex_message_items", "tool_name", "effect_disposition", "timestamp",
     "platform_message_id", "api_content", "anthropic_content_blocks", "bedrock_content_blocks", MESSAGE_UID,
+    "reasoning",
 )
 _STRIP_TC_KEYS = ("call_id", "response_item_id")
 _HIGH_EFFORTS = {"high", "xhigh", "max", "ultra"}
@@ -379,12 +382,15 @@ def _sanitize_message(
 ) -> dict | None:
     """Sanitized copy of ``msg``, or None when nothing needs stripping.
 
-    Drops persistence sidecars, ``_``-prefixed scaffolding markers, tool-call ``call_id`` /
+    Drops persistence sidecars, trajectory-only ``reasoning`` (replayed as
+    ``reasoning_content`` for thinking models; strict providers reject it with
+    ``extra_forbidden``), ``_``-prefixed scaffolding markers, tool-call ``call_id`` /
     ``response_item_id`` (and ``extra_content`` unless Gemini), an assistant
     ``tool_calls: []`` / ``null`` (strict providers reject both), ``name``
     on tool results (schema-valid only on user/assistant messages; strict
     providers reject it with ``contains item with unknown key name``), and
-    ``reasoning_details`` unless the route replays it (``_route_replays_reasoning_details``).
+    ``reasoning_details`` unless the route replays it (``_route_replays_reasoning_details``;
+    strict hosts such as Mistral reject it with HTTP 422 ``extra_forbidden`` — #130757).
     On a replaying route, private ``<provider>.native_assistant`` carriers still go only to the
     profile that declared that exact type: another provider's signed replay is meaningless (or
     rejected) elsewhere, and stored history keeps it for a return to the original provider.
