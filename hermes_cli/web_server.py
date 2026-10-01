@@ -447,6 +447,9 @@ app.add_middleware(
 # is gated below. Shared with the OAuth gate so the two allowlists cannot
 # drift (/api/status once 401'd under the OAuth gate, breaking the portal probe).
 from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS as _PUBLIC_API_PATHS
+from hermes_cli.dashboard_auth.public_paths import (
+    is_desktop_loopback_exempt_path as _is_desktop_loopback_exempt_path,
+)
 
 
 def _has_valid_session_token(request: Request) -> bool:
@@ -558,6 +561,34 @@ def _desktop_loopback_auth_exempt(
         and os.environ.get("HERMES_DESKTOP") == "1"
         and bool(os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or ssh_session_token or ssh_owner_nonce)
     )
+
+
+def _desktop_loopback_request_exempt(request: Request) -> bool:
+    """True when a dashboard read may authenticate with the Desktop per-spawn session token (#126391).
+
+    The startup exemption (:func:`_desktop_loopback_auth_exempt`) only decides whether the
+    ticket-only gate engages for the process; when the gate IS engaged, its cookie/bearer
+    paths refuse the loopback session token outright, so the Desktop's polled reads
+    (``/api/profiles``, ``/api/sessions`` + subpaths, ``/api/kanban``, ``/api/artifacts``)
+    401 despite carrying it. This extends that same exemption to the request, requiring ALL
+    of: a ``GET``/``HEAD`` read against one of those families (``/``-delimited subpaths
+    included, so ``POST /api/profiles`` stays gated), a loopback bind, a Desktop-owned
+    backend holding an operator-minted credential, and a valid session token on the
+    request. Anything else falls through to the normal gates (401).
+    """
+    if not _is_desktop_loopback_exempt_path(request.url.path, request.method):
+        return False
+    bound_host = getattr(request.app.state, "bound_host", None)
+    if bound_host not in _LOOPBACK_HOST_VALUES:
+        return False
+    exempt = getattr(request.app.state, "desktop_loopback_exempt", None)
+    if exempt is None:
+        # Gate engaged without _configure_auth_gate (tests): recompute from the
+        # bound host + process env, also honouring the SSH-spawn argv form.
+        exempt = _desktop_loopback_auth_exempt(bound_host) or is_desktop_owned_backend()
+    if not exempt:
+        return False
+    return _has_valid_session_token(request)
 
 
 def _host_header_hostname(host_header: str) -> str:
@@ -1152,7 +1183,13 @@ def _configure_auth_gate(
     app.state.trusted_public_hosts = _dashboard_public_hosts()
     # auth_required drives middleware, SPA-token injection, WS auth, the
     # startup refusal, the gate-on banner and uvicorn proxy_headers.
-    if _desktop_loopback_auth_exempt(host, ssh_session_token, ssh_owner_nonce):
+    # ``desktop_loopback_exempt`` records the same verdict for the per-request
+    # session-token exemption (#126391), including SSH-spawn credentials that
+    # are process params rather than env at request time.
+    app.state.desktop_loopback_exempt = _desktop_loopback_auth_exempt(
+        host, ssh_session_token, ssh_owner_nonce
+    )
+    if app.state.desktop_loopback_exempt:
         # public_url describes the operator's PUBLIC deployment, not this
         # Desktop-owned loopback backend (#96490), which authenticates with the
         # per-spawn session token the ticket-only gate would refuse.

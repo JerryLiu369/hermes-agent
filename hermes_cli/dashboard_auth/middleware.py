@@ -26,6 +26,7 @@ from hermes_cli.dashboard_auth.cookies import (
     set_session_provider_cookie, set_sso_attempt_cookie)
 from hermes_cli.dashboard_auth.prefix import prefix_from_request
 from hermes_cli.dashboard_auth.public_paths import PUBLIC_API_PATHS
+from hermes_cli.dashboard_auth.public_paths import is_desktop_loopback_exempt_path
 from hermes_cli.dashboard_auth.refresh_singleflight import refresh_session_coalesced
 from hermes_cli.dashboard_auth.request_utils import (
     access_token_max_age as _expires_in_seconds, client_ip as _client_ip,
@@ -49,6 +50,20 @@ def _path_is_public(path: str) -> bool:
     prefix-matched."""
     return path in PUBLIC_API_PATHS or any(
         path == p or path.startswith(p) for p in _GATE_PUBLIC_PREFIXES)
+
+
+def _desktop_loopback_session_token_exempt(request: Request) -> bool:
+    """True when a gated request may use the Desktop per-spawn session token (#126391).
+
+    Same exemption as the startup bypass, extended to the request: a ``GET``/``HEAD``
+    read against the Desktop-polled families on a loopback bind of a Desktop-owned
+    backend, carrying a valid session token. The check itself lives on
+    ``hermes_cli.web_server`` (loopback values + token live there); imported late
+    so this module stays importable without the server.
+    """
+    from hermes_cli import web_server as _web_server
+
+    return _web_server._desktop_loopback_request_exempt(request)
 
 
 def _safe_next_target(request: Request) -> str:
@@ -158,6 +173,12 @@ async def gated_auth_middleware(
     # Already authenticated by the token-auth seam (service caller on a registered token
     # route): not a cookie session, must not bounce to /login.
     if getattr(request.state, "token_authenticated", False) or _path_is_public(request.url.path):
+        return await call_next(request)
+    # Desktop-owned loopback backend (#126391): its polled dashboard reads
+    # authenticate with the per-spawn session token the ticket-only paths
+    # below would refuse. Checked before the bearer block so a valid session
+    # token is honoured on those GET families.
+    if _desktop_loopback_session_token_exempt(request):
         return await call_next(request)
     # RFC 8252 native-app bearer path: the same provider-minted access token the cookie flow
     # stores, verified with the same provider stack, no cookie read or set. A presented-but-
