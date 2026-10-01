@@ -499,25 +499,127 @@ def _codex_developer_instructions(agent) -> str:
 # turn's projected rows were committed, read by the next AIAgent built for the same Hermes session so an
 # API-server restart (or the per-request agents of /api/sessions/{id}/chat) resumes the model-side thread
 # instead of starting an empty one while Hermes' own transcript continues (#100531).
+#
+# The binding rides with a transcript watermark (``codex_thread_watermark``: the active message
+# head id + count at commit time). A recreated agent resumes only while the durable transcript still
+# ends where the binding left it — the one new row allowed is this turn's already-persisted user
+# input. Any further rows past the watermark (an intervening turn on another provider/route, fresh
+# turns elsewhere) mean the codex thread no longer holds the conversation: the resume is skipped
+# (non-destructively — the stored binding is left alone) so the fresh thread is seeded with the
+# updated history (#127103). Provider/base_url string comparison is deliberately NOT used: the API
+# server never writes the gateway_runtime marker, spellings differ (``custom:<name>`` vs ``custom``,
+# trailing ``/``), and a stale marker would wipe the binding on every request.
 _CODEX_THREAD_ID_KEY = "codex_thread_id"
+_CODEX_THREAD_WATERMARK_KEY = "codex_thread_watermark"
 _CODEX_THREAD_RESUME_NOTICE = "Codex thread could not be resumed; starting a new one."
 
 
-def _stored_codex_thread_id(agent) -> str | None:
+def _capture_codex_thread_watermark(agent) -> dict | None:
+    """Active-transcript watermark at commit time: ``{"head_id", "count"}``.
+
+    ``None`` when the DB cannot answer (no DB/session, stub without the probe, empty
+    transcript, read error) — the caller stores the thread id without a watermark and the
+    resume path fails open to the historical resume behaviour.
+    """
     db, session_id = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
     if db is None or not session_id:
         return None
-    thread_id = db.get_session_model_config_value(session_id, _CODEX_THREAD_ID_KEY)
-    return thread_id if isinstance(thread_id, str) and thread_id else None
+    probe = getattr(db, "get_active_message_ids", None)
+    if not callable(probe):
+        return None
+    try:
+        ids = probe(session_id)
+    except Exception:
+        logger.debug("codex thread watermark capture failed", exc_info=True)
+        return None
+    if not isinstance(ids, (list, tuple)):
+        return None
+    try:
+        ids = [int(row_id) for row_id in ids]
+    except (TypeError, ValueError):
+        return None
+    if not ids:
+        return None
+    return {"head_id": ids[-1], "count": len(ids)}
+
+
+def _stored_codex_thread_id(agent) -> str | None:
+    """Stored thread id, or ``None`` when there is none or the watermark proves it stale.
+
+    Pure lookup: a stale watermark never clears the row (the fresh thread overwrites the
+    binding once its own turn commits). A missing/malformed watermark (pre-#127103 rows,
+    stub DBs) resumes as before; a DB read failure fails open to resume so a transient
+    store wobble cannot strand the conversation on a blind thread.
+    """
+    db, session_id = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
+    if db is None or not session_id:
+        return None
+    try:
+        thread_id = db.get_session_model_config_value(session_id, _CODEX_THREAD_ID_KEY)
+    except Exception:
+        logger.debug("codex thread id lookup failed", exc_info=True)
+        return None
+    if not isinstance(thread_id, str) or not thread_id:
+        return None
+    try:
+        watermark = db.get_session_model_config_value(session_id, _CODEX_THREAD_WATERMARK_KEY)
+    except Exception:
+        logger.debug("codex thread watermark lookup failed", exc_info=True)
+        return thread_id
+    if watermark is None:
+        return thread_id
+    if not isinstance(watermark, dict):
+        return thread_id
+    try:
+        head_id = int(watermark.get("head_id"))
+        watermark_count = int(watermark.get("count"))
+    except (TypeError, ValueError):
+        return thread_id
+    probe = getattr(db, "get_active_message_ids", None)
+    if not callable(probe):
+        return thread_id
+    try:
+        ids = [int(row_id) for row_id in (probe(session_id) or [])]
+    except Exception:
+        logger.debug("codex thread watermark validation failed", exc_info=True)
+        return thread_id
+    if head_id not in ids:
+        logger.info("codex thread %s not resumed: transcript head moved past the stored watermark "
+                    "(session=%s)", thread_id[:8], session_id)
+        return None
+    # Rows up to the watermark must still be exactly the watermarked prefix: fewer means an
+    # earlier rewrite (rewind/clear/replace) the thread no longer reflects.
+    if ids.index(head_id) + 1 != watermark_count:
+        logger.info("codex thread %s not resumed: transcript before the watermark changed (session=%s)",
+                    thread_id[:8], session_id)
+        return None
+    # Rows past the watermark: none (pre-persist probe) or exactly this turn's user input means
+    # continuity; anything more is an intervening turn elsewhere — seed a fresh thread instead.
+    if len(ids) - (ids.index(head_id) + 1) <= 1:
+        return thread_id
+    logger.info("codex thread %s not resumed: %d message(s) past the stored watermark (session=%s)",
+                thread_id[:8], len(ids) - (ids.index(head_id) + 1), session_id)
+    return None
 
 
 def _store_codex_thread_id(agent, thread_id: str | None) -> None:
-    """Merge (``None`` clears) the binding into the session row; a failed write only logs — the turn is done."""
+    """Merge the binding (+ watermark) into the session row; ``None`` clears both.
+
+    The watermark is captured AFTER the turn's rows are durable and stored in the same
+    ``patch_session_model_config`` write so id and watermark stay consistent. A failed write
+    only logs — the turn is done. A watermark that cannot be captured stores the id alone
+    (next resume fails open to resume).
+    """
     db, session_id = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
     if db is None or not session_id:
         return
+    if not isinstance(thread_id, str) or not thread_id:
+        _call_guarded(db.patch_session_model_config, "codex thread id could not be stored on the session row",
+                      args=(session_id, {_CODEX_THREAD_ID_KEY: None, _CODEX_THREAD_WATERMARK_KEY: None}))
+        return
+    watermark = _capture_codex_thread_watermark(agent)
     _call_guarded(db.patch_session_model_config, "codex thread id could not be stored on the session row",
-                  args=(session_id, {_CODEX_THREAD_ID_KEY: thread_id}))
+                  args=(session_id, {_CODEX_THREAD_ID_KEY: thread_id, _CODEX_THREAD_WATERMARK_KEY: watermark}))
 
 
 def _start_codex_thread(agent) -> str:
