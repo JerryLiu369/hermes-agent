@@ -256,3 +256,95 @@ def test_slot_runtime_cache_is_scoped_per_profile_home(monkeypatch, tmp_path):
         assert moa._slot_runtime(slot)["api_key"] == "key-b"
     finally:
         hermes_constants.reset_hermes_home_override(tok)
+
+
+def test_expired_read_evicts_stale_entry(monkeypatch):
+    """Reading an expired entry must pop it so stale credentials do not linger."""
+    import time
+
+    import agent.moa_loop as moa
+
+    moa._runtime_cache.clear()
+    try:
+        key = (hermes_home_key(), "openai", "gpt-5")
+        stale = {"provider": "openai", "model": "gpt-5", "api_key": "stale-key"}
+        moa._runtime_cache[key] = (
+            time.monotonic() - moa._RUNTIME_CACHE_TTL_SECONDS - 1, stale
+        )
+
+        def _boom(*a, **k):
+            raise RuntimeError("catalog hiccup")
+
+        import hermes_cli.runtime_provider as rt_mod
+        monkeypatch.setattr(rt_mod, "resolve_runtime_provider", _boom)
+
+        fallback = moa._slot_runtime({"provider": "openai", "model": "gpt-5"})
+        assert "api_key" not in fallback
+        assert key not in moa._runtime_cache
+    finally:
+        moa._runtime_cache.clear()
+
+
+def test_write_prunes_expired_entries(monkeypatch):
+    """Writing a fresh entry must prune expired entries."""
+    import time
+
+    import agent.moa_loop as moa
+
+    moa._runtime_cache.clear()
+    try:
+        home = hermes_home_key()
+        now = time.monotonic()
+        expired_key = (home, "openai", "stale-model")
+        fresh_key = (home, "openai", "fresh-model")
+        moa._runtime_cache[expired_key] = (
+            now - moa._RUNTIME_CACHE_TTL_SECONDS - 1,
+            {"provider": "openai", "model": "stale-model", "api_key": "stale"},
+        )
+        moa._runtime_cache[fresh_key] = (
+            now, {"provider": "openai", "model": "fresh-model"}
+        )
+
+        import hermes_cli.runtime_provider as rt_mod
+        monkeypatch.setattr(
+            rt_mod, "resolve_runtime_provider",
+            lambda **kw: {"base_url": "http://x", "api_key": "new", "api_mode": None},
+        )
+
+        moa._slot_runtime({"provider": "openai", "model": "new-model"})
+        assert expired_key not in moa._runtime_cache
+        assert fresh_key in moa._runtime_cache
+        assert (home, "openai", "new-model") in moa._runtime_cache
+    finally:
+        moa._runtime_cache.clear()
+
+
+def test_runtime_cache_bound_evicts_oldest(monkeypatch):
+    """Beyond _RUNTIME_CACHE_MAX_ENTRIES the oldest entry is evicted."""
+    import time
+
+    import agent.moa_loop as moa
+
+    moa._runtime_cache.clear()
+    try:
+        home = hermes_home_key()
+        now = time.monotonic()
+        for i in range(moa._RUNTIME_CACHE_MAX_ENTRIES):
+            moa._runtime_cache[(home, "openai", f"model-{i}")] = (
+                now + i * 0.001, {"provider": "openai", "model": f"model-{i}"}
+            )
+        oldest_key = (home, "openai", "model-0")
+        assert oldest_key in moa._runtime_cache
+
+        import hermes_cli.runtime_provider as rt_mod
+        monkeypatch.setattr(
+            rt_mod, "resolve_runtime_provider",
+            lambda **kw: {"base_url": "http://x", "api_key": "new", "api_mode": None},
+        )
+
+        moa._slot_runtime({"provider": "openai", "model": "model-new"})
+        assert len(moa._runtime_cache) == moa._RUNTIME_CACHE_MAX_ENTRIES
+        assert oldest_key not in moa._runtime_cache
+        assert (home, "openai", "model-new") in moa._runtime_cache
+    finally:
+        moa._runtime_cache.clear()

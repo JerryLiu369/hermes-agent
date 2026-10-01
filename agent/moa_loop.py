@@ -149,6 +149,10 @@ _runtime_cache: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
 # Short TTL so rotated keys / base_url edits are picked up within 5 minutes.
 _RUNTIME_CACHE_TTL_SECONDS = 300.0
 
+# Bound so distinct (profile, provider, model) triples cannot retain
+# resolved api_key payloads for the life of the process.
+_RUNTIME_CACHE_MAX_ENTRIES = 128
+
 # Cap on concurrent reference calls (guards pathologically large presets).
 _MAX_REFERENCE_WORKERS = 8
 
@@ -261,8 +265,11 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
     now = time.monotonic()
     with _runtime_cache_lock:
         entry = _runtime_cache.get(cache_key)
-    if entry is not None and now - entry[0] < _RUNTIME_CACHE_TTL_SECONDS:
-        return entry[1]
+        if entry is not None:
+            if now - entry[0] < _RUNTIME_CACHE_TTL_SECONDS:
+                return entry[1]
+            # Expired: evict so stale credentials do not linger.
+            _runtime_cache.pop(cache_key, None)
     out: dict[str, Any] = {"provider": provider, "model": model}
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -276,8 +283,16 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
         logger.warning("MoA slot %s: provider '%s' could not be resolved (%s); calling with bare provider/model",
                        _slot_label(slot), provider, exc)
         return out
+    write_now = time.monotonic()
     with _runtime_cache_lock:
-        _runtime_cache[cache_key] = (now, out)
+        # Prune expired entries so dead keys do not pin the cache at the bound.
+        for key, (stamped_at, _cached) in list(_runtime_cache.items()):
+            if write_now - stamped_at >= _RUNTIME_CACHE_TTL_SECONDS:
+                _runtime_cache.pop(key, None)
+        if cache_key not in _runtime_cache and len(_runtime_cache) >= _RUNTIME_CACHE_MAX_ENTRIES:
+            oldest_key = min(_runtime_cache, key=lambda k: _runtime_cache[k][0])
+            _runtime_cache.pop(oldest_key, None)
+        _runtime_cache[cache_key] = (write_now, out)
     return out
 
 
