@@ -112,32 +112,54 @@ class TestMergeLoginShellPath:
 
 
 class TestCapture:
-    def test_probe_uses_login_only_and_printenv(self, tmp_path, monkeypatch):
-        """The probe must be ``-l`` (never ``-i``: interactive init spawns
-        daemons that wedge a TTY-less probe, #107109) and shell-agnostic
-        (fish rejects ``${PATH}``, #107845)."""
+    def test_probe_uses_ladder_and_printenv(self, tmp_path, monkeypatch):
         fake = tmp_path / "zsh"
         fake.write_text("#!/bin/sh\n")
         _make_executable(fake)
         monkeypatch.setenv("SHELL", str(fake))
-        seen = {}
+        seen = []
 
         class _FakeProc:
             def communicate(self, timeout=None):
                 return ("__HERMES_LOGIN_PATH_START__/a:/b__HERMES_LOGIN_PATH_END__", "")
 
         def _fake_popen(args, **kwargs):
-            seen["args"] = args
-            seen["stdin"] = kwargs.get("stdin")
+            seen.append(args)
             assert "printenv PATH" in args[-1]
             assert "${PATH}" not in args[-1]
-            assert "-i" not in args
-            assert "-l" in args
+            assert args[1] == "-ilc"
             return _FakeProc()
 
         with patch.object(local_mod.subprocess, "Popen", _fake_popen):
             assert _capture_user_login_shell_path() == "/a:/b"
-        assert seen["args"][0] == str(fake)
+        assert len(seen) == 1
+        assert seen[0][0] == str(fake)
+
+    def test_probe_ladder_falls_back_to_lc_when_ilc_fails(self, tmp_path, monkeypatch):
+        fake = tmp_path / "zsh"
+        fake.write_text("#!/bin/sh\n")
+        _make_executable(fake)
+        monkeypatch.setenv("SHELL", str(fake))
+        seen_flags = []
+
+        class _SuccessProc:
+            def communicate(self, timeout=None):
+                return ("__HERMES_LOGIN_PATH_START__/from_lc__HERMES_LOGIN_PATH_END__", "")
+
+        class _FailProc:
+            def communicate(self, timeout=None):
+                return ("no markers here", "")
+
+        def _fake_popen(args, **kwargs):
+            flag = args[1]
+            seen_flags.append(flag)
+            if flag == "-ilc":
+                return _FailProc()
+            return _SuccessProc()
+
+        with patch.object(local_mod.subprocess, "Popen", _fake_popen):
+            assert _capture_user_login_shell_path() == "/from_lc"
+        assert seen_flags == ["-ilc", "-lc"]
 
     def test_nonzero_exit_still_trusts_sentinel(self, tmp_path, monkeypatch):
         fake = tmp_path / "zsh"
@@ -152,21 +174,33 @@ class TestCapture:
         with patch.object(local_mod.subprocess, "Popen", lambda *a, **k: _FakeProc()):
             assert _capture_user_login_shell_path() == "/x:/y"
 
-    def test_failure_returns_none_and_caches(self, tmp_path, monkeypatch):
+    def test_failure_does_not_cache_and_allows_reprobe(self, tmp_path, monkeypatch):
         fake = tmp_path / "zsh"
         fake.write_text("#!/bin/sh\n")
         _make_executable(fake)
         monkeypatch.setenv("SHELL", str(fake))
-        calls = []
+        attempt = 0
 
-        def _boom(*a, **k):
-            calls.append(1)
-            raise OSError("no shell")
+        class _SuccessProc:
+            def communicate(self, timeout=None):
+                return ("__HERMES_LOGIN_PATH_START__/recovered__HERMES_LOGIN_PATH_END__", "")
 
-        with patch.object(local_mod.subprocess, "Popen", _boom):
+        def _flaky_popen(args, **kwargs):
+            nonlocal attempt
+            attempt += 1
+            if attempt <= 2:  # first capture tries -ilc then -lc and fails
+                raise OSError("slow shell timeout")
+            return _SuccessProc()
+
+        with patch.object(local_mod.subprocess, "Popen", _flaky_popen):
+            # First call fails on both ladder rungs, returns None, does not cache None
             assert _capture_user_login_shell_path() is None
-            assert _capture_user_login_shell_path() is None
-        assert len(calls) == 1
+            assert attempt == 2
+            # Second call re-probes and recovers
+            assert _capture_user_login_shell_path() == "/recovered"
+            # Third call uses success cache without re-probing
+            assert _capture_user_login_shell_path() == "/recovered"
+            assert attempt == 3
 
     def test_timeout_kills_group_and_returns_none(self, tmp_path, monkeypatch):
         fake = tmp_path / "zsh"

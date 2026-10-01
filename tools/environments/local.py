@@ -761,18 +761,29 @@ _hermes_site_packages: list[Path] | None = None  # lazily cached by local_python
 # so a zsh login shell's ~/.zprofile (Homebrew, pyenv, conda on macOS) is never
 # read and /opt/homebrew/bin loses to /usr/bin. When $SHELL names zsh/fish,
 # capture that shell's login PATH once and merge it in front of the inherited
-# PATH before the snapshot is taken. Login-only (``-l``), never interactive
-# (``-i``): interactive init spawns daemons that wedge a TTY-less probe
-# (zsh + Powerlevel10k gitstatusd, #107109). A broken/slow profile must never
-# brick terminal execution, so the probe is bounded, stdin-closed, and any
-# failure leaves PATH untouched (same hardening as apps/desktop shell-path.ts).
+# PATH before the snapshot is taken.
+# ``-l`` sources ~/.zprofile / ~/.profile (where ``brew shellenv`` lives);
+# ``-i`` sources ~/.zshrc (where nvm/pyenv/asdf/conda PATH edits live) — ``-l``
+# alone misses the ~/.zshrc half. So try ``-ilc`` first, then fall back to
+# ``-lc`` (same ladder as apps/desktop/electron/shell-path.ts). Each attempt is
+# bounded, stdin-closed, and group-killed: interactive init can spawn daemons
+# that wedge a TTY-less probe (zsh + Powerlevel10k gitstatusd, #107109), but the
+# bound keeps the wedge protection. A broken/slow profile must never brick
+# terminal execution, so any failure leaves PATH untouched. Only successes are
+# cached; failures are re-probed next time and emit a debug log.
 _LOGIN_SHELL_PATH_START = "__HERMES_LOGIN_PATH_START__"
 _LOGIN_SHELL_PATH_END = "__HERMES_LOGIN_PATH_END__"
 _LOGIN_SHELL_PATH_TIMEOUT_S = 5.0
+# Probe flags in preference order: interactive-login first (both rc files),
+# then login-only. Some shells swallow combined ``-ilc`` with a non-tty stdin,
+# so the plain login shell is the fallback before giving up.
+_LOGIN_SHELL_PATH_FLAGS = ("-ilc", "-lc")
 # Shells whose login PATH the bash snapshot does not already cover. bash/sh/
 # dash/ksh share ~/.profile (already sourced); zsh/fish do not.
 _LOGIN_SHELL_PATH_CAPTURE_ALLOWLIST = frozenset({"zsh", "fish"})
-_login_shell_path_cache: dict[str, str | None] = {}
+# Success-only cache: a failed probe (slow/broken rc) must not disable the fix
+# for the life of a long-running gateway — the next call re-probes.
+_login_shell_path_cache: dict[str, str] = {}
 
 
 def _user_login_shell_for_path_capture() -> str | None:
@@ -817,19 +828,14 @@ def _extract_login_shell_path(output: str) -> str | None:
     return value or None
 
 
-def _capture_user_login_shell_path(timeout: float = _LOGIN_SHELL_PATH_TIMEOUT_S) -> str | None:
-    """Run the user's login shell once (``-l``, non-interactive) and return its
-    PATH, or None on any failure. Results (including None) are cached per shell
-    path so every terminal command does not re-probe. Never raises."""
-    shell = _user_login_shell_for_path_capture()
-    if shell is None:
-        return None
-    if shell in _login_shell_path_cache:
-        return _login_shell_path_cache[shell]
-    captured: str | None = None
+def _probe_login_shell_path_once(shell: str, flag: str, timeout: float) -> str | None:
+    """Run one probe rung (``flag`` is ``-ilc`` or ``-lc``) and return its PATH,
+    or None on any failure. Bounded, stdin-closed, group-killed on timeout; a
+    profile may exit nonzero after the sentinel printed — trust the sentinel,
+    not the exit code. Never raises."""
     try:
         proc = subprocess.Popen(
-            [shell, "-l", "-c", _login_shell_probe_command()],
+            [shell, flag, _login_shell_probe_command()],
             text=True, encoding="utf-8", errors="replace",
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             stdin=subprocess.DEVNULL, start_new_session=True,
@@ -844,16 +850,30 @@ def _capture_user_login_shell_path(timeout: float = _LOGIN_SHELL_PATH_TIMEOUT_S)
                 proc.kill()
             with contextlib.suppress(Exception):
                 out, _ = proc.communicate(timeout=2)
-                captured = _extract_login_shell_path(out or "")
+                return _extract_login_shell_path(out or "")
+            return None
+        return _extract_login_shell_path(out or "")
+    except Exception:
+        return None
+
+
+def _capture_user_login_shell_path(timeout: float = _LOGIN_SHELL_PATH_TIMEOUT_S) -> str | None:
+    """Run the user's login shell (``-ilc`` then ``-lc``) and return its PATH,
+    or None on any failure. Only successes are cached per shell path so every
+    terminal command does not re-probe; failures are re-probed next time and
+    emit a debug log. Never raises."""
+    shell = _user_login_shell_for_path_capture()
+    if shell is None:
+        return None
+    if shell in _login_shell_path_cache:
+        return _login_shell_path_cache[shell]
+    for flag in _LOGIN_SHELL_PATH_FLAGS:
+        if captured := _probe_login_shell_path_once(shell, flag, timeout):
             _login_shell_path_cache[shell] = captured
             return captured
-        # A profile may exit nonzero after the sentinel already printed —
-        # trust the sentinel, not the exit code.
-        captured = _extract_login_shell_path(out or "")
-    except Exception:
-        captured = None
-    _login_shell_path_cache[shell] = captured
-    return captured
+    logger.debug(
+        "Login-shell PATH probe failed for %s; leaving PATH untouched", shell)
+    return None
 
 
 def _reset_login_shell_path_cache() -> None:
