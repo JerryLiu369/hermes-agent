@@ -104,3 +104,12 @@ class TestUtf16Read:
         assert result.error is None
         assert "just utf-8" in result.content
         assert "Transcoded" not in (result.hint or "")
+
+    def test_utf16_non_bmp_unicode_filename(self, fops, tmp_path):
+        # Filenames containing emoji or CJK extension characters (#129888).
+        target = tmp_path / "报告-😀-𠀀.txt"
+        target.write_bytes("hello utf16 world\n".encode("utf-16-le"))
+        result = fops.read_file(str(target))
+        assert result.error is None
+        assert result.is_binary is False
+        assert "hello utf16 world" in result.content

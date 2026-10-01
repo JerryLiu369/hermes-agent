@@ -30,6 +30,18 @@ def test_delete_file_removes_regular_file(ops, tmp_path):
     assert not target.exists()
 
 
+def test_delete_file_non_bmp_unicode_filename(ops, tmp_path):
+    # Filenames containing emoji or CJK extension characters (outside BMP)
+    # must not fail with surrogate encoding errors (#129888).
+    target = tmp_path / "报告-😀-𠀀.txt"
+    target.write_text("bye", encoding="utf-8")
+
+    result = ops.delete_file(str(target))
+
+    assert result.error is None
+    assert not target.exists()
+
+
 def test_delete_file_refuses_directory(ops, tmp_path):
     target = tmp_path / "dir"
     target.mkdir()
