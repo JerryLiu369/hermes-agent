@@ -71,6 +71,7 @@ _CREDENTIAL_ROOT_FILES = [
     ".npmrc", "npmrc", ".pypirc",
     ".netrc", ".pgpass", ".git-credentials",
     "google_oauth.json", "google_token.json", "google_oauth_pending.json",
+    "google_client_secret.json",
     "google_chat_user_token.json", "google_chat_user_client_secret.json",
     "google_chat_user_oauth_pending.json",
     "slack_tokens.json",
@@ -269,7 +270,7 @@ class TestComprehensiveCredentialExclusion:
         skill_dir = profile_dir / "skills" / "demo"
         for name in (
             ".env", ".op.env", "npmrc", ".anthropic_oauth.json",
-            "google_token.json", "slack_tokens.json",
+            "google_token.json", "google_client_secret.json", "slack_tokens.json",
             "webhook_subscriptions.json",
             ".netrc", ".pgpass", ".git-credentials",
         ):
@@ -308,7 +309,7 @@ class TestComprehensiveCredentialExclusion:
         # Task-named examples, explicit.
         for name in (
             ".op.env", "npmrc", ".anthropic_oauth.json",
-            "google_token.json", "slack_tokens.json",
+            "google_token.json", "google_client_secret.json", "slack_tokens.json",
             "webhook_subscriptions.json",
         ):
             assert name not in basenames, f"{name} must NOT be in default export"

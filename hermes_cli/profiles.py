@@ -2158,6 +2158,7 @@ _EXPORT_CREDENTIAL_FILES = frozenset({
     ".netrc", ".pgpass", ".git-credentials",
     # OAuth token stores (Google, Google Chat per-user, Slack, Bitwarden cache)
     "google_oauth.json", "google_token.json", "google_oauth_pending.json",
+    "google_client_secret.json",
     "google_chat_user_token.json", "google_chat_user_client_secret.json",
     "google_chat_user_oauth_pending.json",
     "slack_tokens.json",
