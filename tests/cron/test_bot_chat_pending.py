@@ -196,3 +196,134 @@ def test_non_dict_deferred_receipt_is_skipped_by_the_drain_and_fails_exact_id_re
     with pytest.raises(ValueError):
         queue.defer("e" * 64, {"id": "job"}, "same id", "", tmp_path)
     assert bad.read_text(encoding="utf-8") == payload
+
+
+def _stub_tui_server(monkeypatch, home):
+    """Fake in-process tui_gateway server: no heavy import, no real-home I/O."""
+    import sys
+    import threading
+    import types
+    fake = types.ModuleType("tui_gateway.server")
+    fake._sessions = {}
+    fake._sessions_lock = threading.RLock()
+    fake._detached_ws_transport = object()
+    fake._launch_home = lambda: home
+    monkeypatch.setitem(sys.modules, "tui_gateway.server", fake)
+    return fake
+
+
+def _inject_visible_desktop_session(srv, home, session_key, *, sid="visible-sid", source="desktop",
+                                    finalized=False, transport=None, agent=None,
+                                    profile_home=None):
+    """Lease-free resumed Desktop record in the (stubbed) tui_gateway server."""
+    if transport is None:
+        transport = object()
+    record = {
+        "session_key": session_key,
+        "profile_home": str(profile_home if profile_home is not None else home),
+        "transport": transport,
+        "source": source,
+        "agent": agent,
+    }
+    if finalized:
+        record["_finalized"] = True
+    srv._sessions[sid] = record
+    return sid
+
+
+def test_lease_free_visible_desktop_defers_and_drain_skips_until_close(tmp_path, monkeypatch):
+    """Resumed Desktop Bot Chat holds no lease until its first turn; the CLI fallback must not
+    steal it (regression for #129858: SESSION_NOT_OWNED fenced the human out mid-turn)."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(session_id="chat", source="desktop")
+    db.set_session_title("chat", "Bot Chat")
+    from tools import bot_live_delivery as live
+    srv = _stub_tui_server(monkeypatch, tmp_path)
+    sid = "visible-desktop-sid"
+    try:
+        _inject_visible_desktop_session(srv, tmp_path, "chat", sid=sid)
+        owner = live.find_canonical_owner(tmp_path)
+        assert owner is not None
+        assert owner.get("surface") == "desktop"
+        assert owner.get("session_id") == "chat"
+        assert owner.get("live_session_id") == sid
+        assert live.find_canonical_live_owner(tmp_path) is None
+
+        run = Mock(return_value=subprocess.CompletedProcess([], 0, "", ""))
+        monkeypatch.setattr(delivery, "_run_bot_chat_turn", run)
+        job = {"id": "job", "execution_id": "execution"}
+        assert "queued" in delivery._deliver_to_bot_chat(job, "output", "")
+        key = job["_bot_chat_delivery_receipts"]["bot-chat:(own)"]["delivery_id"]
+        run.assert_not_called()
+
+        queue.drain()
+        run.assert_not_called()
+        assert queue.read_pending(key)["status"] == "queued"
+
+        srv._sessions.pop(sid, None)
+        assert live.find_canonical_owner(tmp_path) is None
+
+        queue.drain()
+        assert run.call_count == 1
+        assert queue.read_pending(key)["status"] == "settled"
+    finally:
+        srv._sessions.pop(sid, None)
+        db.close()
+
+
+def test_visible_session_matching_rules(tmp_path, monkeypatch):
+    """Only a live, same-profile, non-gateway visible session blocks the fallback."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(session_id="chat", source="desktop")
+    db.set_session_title("chat", "Bot Chat")
+    from tools import bot_live_delivery as live
+    srv = _stub_tui_server(monkeypatch, tmp_path)
+    try:
+        _inject_visible_desktop_session(
+            srv, tmp_path, "chat", sid="other-profile",
+            profile_home=str(tmp_path / "other"))
+        assert live.find_canonical_owner(tmp_path) is None
+        srv._sessions.pop("other-profile", None)
+
+        _inject_visible_desktop_session(
+            srv, tmp_path, "chat", sid="gateway-source", source="telegram")
+        assert live.find_canonical_owner(tmp_path) is None
+        srv._sessions.pop("gateway-source", None)
+
+        class _Agent:
+            session_id = "chat"
+
+        _inject_visible_desktop_session(
+            srv, tmp_path, "stale-key", sid="agent-tip", agent=_Agent())
+        owner = live.find_canonical_owner(tmp_path)
+        assert owner is not None
+        assert owner.get("session_id") == "chat"
+        assert owner.get("live_session_id") == "agent-tip"
+        assert live.find_canonical_live_owner(tmp_path) is None
+    finally:
+        srv._sessions.clear()
+        db.close()
+
+
+def test_finalized_or_detached_visible_session_does_not_block_drain(tmp_path, monkeypatch):
+    """A finalized record or a detached transport is not a visible owner: the drain may proceed."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = SessionDB(db_path=tmp_path / "state.db")
+    db.create_session(session_id="chat", source="desktop")
+    db.set_session_title("chat", "Bot Chat")
+    from tools import bot_live_delivery as live
+    srv = _stub_tui_server(monkeypatch, tmp_path)
+    try:
+        _inject_visible_desktop_session(srv, tmp_path, "chat", sid="finalized", finalized=True)
+        assert live.find_canonical_owner(tmp_path) is None
+        srv._sessions.pop("finalized", None)
+
+        _inject_visible_desktop_session(
+            srv, tmp_path, "chat", sid="detached",
+            transport=srv._detached_ws_transport)
+        assert live.find_canonical_owner(tmp_path) is None
+    finally:
+        srv._sessions.clear()
+        db.close()
