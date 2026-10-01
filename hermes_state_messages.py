@@ -743,19 +743,108 @@ class SessionMessagesMixin:
         except Exception:
             return  # Best-effort: a failed carry falls back to the publish-time stamp, never breaks publish.
 
+    def _existing_transcript_keys(self, conn, session_id: str, messages: List[Dict[str, Any]]) -> dict:
+        """Map ``(role, content, timestamp, tool_call_id, tool_calls, tool_name)`` of this session's
+        active rows onto their stored rows, limited to the batch's explicit timestamps.
+
+        Only messages that carry an explicit timestamp can be byte-identical
+        duplicates: fresh rows are stamped with ``now`` (+1µs) at insert, so a
+        new turn never collides with a stored timestamp. Bounding the lookup to
+        the batch's timestamps keeps the common 1–2 row flush to a single
+        indexed probe instead of a full transcript scan.
+        """
+        candidates: set = set()
+        probe_now = time.time()
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            raw_timestamp = msg.get("timestamp")
+            if raw_timestamp is None:
+                continue
+            try:
+                candidates.add(_coerce_timestamp(raw_timestamp, probe_now))
+            except Exception:
+                continue
+        if not candidates:
+            return {}
+        try:
+            existing: dict = {}
+            stamps = list(candidates)
+            for start in range(0, len(stamps), 500):
+                chunk = stamps[start:start + 500]
+                rows = conn.execute(
+                    "SELECT id, role, content, timestamp, tool_call_id, tool_calls, tool_name, "
+                    "message_uid, tool_call_uids, tool_call_uid, absorbed_message_uids "
+                    "FROM messages WHERE session_id = ? AND active = 1 AND timestamp IN "
+                    f"({_placeholders(chunk)})",
+                    (session_id, *chunk),
+                ).fetchall()
+                for row in rows:
+                    try:
+                        key = (row["role"], row["content"], row["timestamp"],
+                               row["tool_call_id"], row["tool_calls"], row["tool_name"])
+                    except (KeyError, IndexError, TypeError):
+                        continue
+                    # First row wins: active ids are unique per key in a healthy
+                    # transcript; a pre-existing duplication keeps the earliest.
+                    existing.setdefault(key, row)
+            return existing
+        except Exception:
+            return {}
+
     def _insert_message_rows(self, conn, session_id: str, messages: List[Dict[str, Any]], *,
                              prune_checkpoints: bool = True) -> tuple[int, int]:
         """Insert *messages* as fresh active rows in the caller's txn -> ``(inserted, tool_call_count)``.
         Never touches sessions.* counters (callers reconcile differently); reasoning kept for assistant rows.
         A caller that re-archives some rows afterwards passes ``prune_checkpoints=False`` and prunes once they
-        are archived again (:meth:`_prune_shadowed_checkpoints`)."""
+        are archived again (:meth:`_prune_shadowed_checkpoints`).
+
+        Defensive dedup (#127869): a byte-identical row — same role, timestamp,
+        content, ``tool_call_id``, ``tool_calls`` and ``tool_name`` — already
+        stored for this session is not inserted again. A failed-turn recovery
+        that rebuilds history from a reloaded transcript replays the same
+        dicts (same microsecond timestamps) through the flush; without this
+        the transcript doubles on every retry. Skipped dicts adopt the stored
+        row's ``_row_id``/identity and marker so later flushes keep skipping
+        them instead of retrying the insert.
+        """
         now_ts = time.time()
         inserted = tool_calls_total = 0
         batch_tool_index: Dict[str, str] = {}
+        existing_by_key = self._existing_transcript_keys(conn, session_id, messages)
         for msg in messages:
             role = msg.get("role", "unknown")
             tool_calls = _parse_tool_calls(msg.get("tool_calls"))
             message_timestamp = _coerce_timestamp(msg.get("timestamp"), now_ts)
+            encoded_content = self._encode_content(msg.get("content"))
+            encoded_tool_calls = json.dumps(tool_calls) if tool_calls else None
+            dedupe_key = (role, encoded_content, message_timestamp,
+                          msg.get("tool_call_id"), encoded_tool_calls,
+                          _scrub_surrogates(msg.get("tool_name")))
+            duplicate_row = existing_by_key.get(dedupe_key)
+            if duplicate_row is not None:
+                # Already durable: adopt the stored identity instead of doubling the row.
+                try:
+                    _restore_identity_columns(duplicate_row, msg)
+                except Exception:
+                    pass
+                msg["timestamp"] = duplicate_row["timestamp"] if "timestamp" in duplicate_row.keys() else message_timestamp
+                try:
+                    msg["_row_id"] = int(duplicate_row["id"])
+                except (TypeError, ValueError, KeyError):
+                    pass
+                msg[_DB_PERSISTED_MARKER_KEY] = True
+                if role == "assistant":
+                    try:
+                        from agent.message_metadata import index_tool_call_uids as _index_uids
+
+                        _index_uids(batch_tool_index, msg)
+                    except Exception:
+                        pass
+                elif role == "user":
+                    batch_tool_index.clear()
+                now_ts = max(now_ts, message_timestamp) + 1e-6
+                continue
             # The durable per-message id: kept when the dict carries one (a copy of an already-stored
             # message), minted and stamped on the dict otherwise. Stamped BEFORE the bind so the row and
             # the live dict never disagree. Tool calls get their per-occurrence ids the same way.
@@ -773,6 +862,14 @@ class SessionMessagesMixin:
             inserted += 1
             tool_calls_total += _tool_calls_count(tool_calls)
             now_ts = max(now_ts, message_timestamp) + 1e-6
+            try:
+                existing_by_key[dedupe_key] = {
+                    "id": cur.lastrowid, MESSAGE_UID: message_uid_or_none(msg),
+                    "tool_call_uids": None, "tool_call_uid": None, "absorbed_message_uids": None,
+                    "timestamp": message_timestamp,
+                }
+            except Exception:
+                pass
         if prune_checkpoints:
             self._prune_shadowed_checkpoints(conn, session_id, messages)
         # Every inserter (flush, compaction clone, replace, rotation handoff, import) gets the new rows' own

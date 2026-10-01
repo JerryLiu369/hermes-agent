@@ -24,7 +24,8 @@ from agent.memory_manager import sanitize_context
 from agent.tool_dispatch_helpers import _is_multimodal_tool_result, _multimodal_text_summary
 from agent.trajectory import save_trajectory as _save_trajectory_to_file
 from agent.message_metadata import (
-    DB_ROW_SNAPSHOT, MERGED_TURN_PREFIX, REPAIR_BOOKKEEPING_FIELDS, TOOL_CALL_UID, copy_identity_fields,
+    DB_ROW_SNAPSHOT, MERGED_TURN_PREFIX, MESSAGE_UID, REPAIR_BOOKKEEPING_FIELDS, TOOL_CALL_UID,
+    copy_identity_fields, message_uid_or_none,
     tool_call_uid_from_history)
 from agent.transcript_repair import sync_flushed_message_markers
 
@@ -192,13 +193,109 @@ def _db_flush_seed_ids(agent) -> set:
 
 
 def _db_flush_scan_start(agent, messages: List[Dict]) -> int:
-    """Skip the identity-matched, still-marked prefix of the previous flush's snapshot."""
+    """Skip the identity-matched, still-marked prefix of the previous flush's snapshot.
+
+    Extended for failed-turn recovery (#127869): when the history list is rebuilt
+    from a reloaded transcript the dicts are different objects, so the ``is``
+    check alone breaks at the rebuild point. A prefix entry that stably matches
+    its snapshot twin (same ``_row_id``, same ``message_uid``, or same
+    role+timestamp+content+tool_call_id) and is already durable (marker or int
+    ``_row_id``) is still safe to skip.
+    """
+    prefix = getattr(agent, "_db_flush_scan_prefix", None) or ()
     scan_start = 0
-    for prev, cur in zip(getattr(agent, "_db_flush_scan_prefix", None) or (), messages):
-        if cur is not prev or not cur.get(_DB_PERSISTED_MARKER):
+    for prev, cur in zip(prefix, messages):
+        if not isinstance(cur, dict) or not isinstance(prev, dict):
+            break
+        if cur is prev:
+            if not cur.get(_DB_PERSISTED_MARKER):
+                break
+            scan_start += 1
+            continue
+        if not _stable_history_match(prev, cur):
+            break
+        if not (cur.get(_DB_PERSISTED_MARKER) or _is_int_row_id(cur.get("_row_id"))):
             break
         scan_start += 1
     return scan_start
+
+
+def _is_int_row_id(value: Any) -> bool:
+    """True for a real SQLite row id (``bool`` is not a row id)."""
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _flush_content_key(msg: Dict) -> Optional[tuple]:
+    """Hashable ``(role, timestamp, content, tool_call_id, tool_calls)`` identity.
+
+    ``None`` when the message carries no explicit timestamp: two distinct new
+    turns may share role+content, and only a byte-identical stored timestamp
+    proves they are the same durable row (#127869).
+    """
+    if not isinstance(msg, dict):
+        return None
+    timestamp = msg.get("timestamp")
+    if timestamp is None:
+        return None
+    content = msg.get("content")
+    if isinstance(content, str):
+        content_key = content
+    elif content is None:
+        content_key = None
+    else:
+        try:
+            import json as _json
+
+            content_key = _json.dumps(content, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            content_key = repr(content)
+    tool_calls = msg.get("tool_calls")
+    if isinstance(tool_calls, list):
+        try:
+            import json as _json
+
+            tool_calls_key = _json.dumps(tool_calls, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            tool_calls_key = repr(tool_calls)
+    elif tool_calls is None:
+        tool_calls_key = None
+    else:
+        tool_calls_key = repr(tool_calls)
+    return (msg.get("role", "unknown"), timestamp, content_key, msg.get("tool_call_id"), tool_calls_key)
+
+
+def _stable_history_match(prev: Any, cur: Any) -> bool:
+    """True when two dicts are the same logical message by a stable identity."""
+    if not isinstance(prev, dict) or not isinstance(cur, dict):
+        return False
+    prev_row_id, cur_row_id = prev.get("_row_id"), cur.get("_row_id")
+    if _is_int_row_id(prev_row_id) and _is_int_row_id(cur_row_id) and prev_row_id == cur_row_id:
+        return True
+    prev_uid, cur_uid = message_uid_or_none(prev), message_uid_or_none(cur)
+    if prev_uid is not None and cur_uid is not None and prev_uid == cur_uid:
+        return True
+    prev_key, cur_key = _flush_content_key(prev), _flush_content_key(cur)
+    return prev_key is not None and cur_key is not None and prev_key == cur_key
+
+
+def _history_identity_sets(conversation_history: Optional[List[Dict]]) -> tuple:
+    """Stable identity sets of the durable history prefix."""
+    row_ids: set = set()
+    uids: set = set()
+    content_keys: set = set()
+    for item in conversation_history or ():
+        if not isinstance(item, dict):
+            continue
+        row_id = item.get("_row_id")
+        if _is_int_row_id(row_id):
+            row_ids.add(row_id)
+        uid = message_uid_or_none(item)
+        if uid is not None:
+            uids.add(uid)
+        key = _flush_content_key(item)
+        if key is not None:
+            content_keys.add(key)
+    return row_ids, uids, content_keys
 
 
 def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any]:
@@ -249,9 +346,22 @@ def _db_flush_row(agent, msg: Dict, is_current_turn_user: bool) -> Dict[str, Any
 def _db_flush_collect(agent, messages: List[Dict], conversation_history: Optional[List[Dict]],
                       replay_history: bool = False):
     """Scan for un-flushed messages; returns ``(rows, msgs)`` to write in one transaction. ``replay_history``
-    (session-row heal) writes the history prefix again instead of stamping it as already durable."""
+    (session-row heal) writes the history prefix again instead of stamping it as already durable.
+
+    Beyond object identity (which a failed-turn recovery rebuild breaks by
+    reloading the transcript into fresh dicts), history membership is also
+    recognized by stable identities — int ``_row_id``, ``message_uid``, or
+    role+timestamp+content+tool_calls (#127869). A dict that carries a
+    stored-row snapshot (a previously flushed live dict whose marker was
+    popped for an in-place rewrite) is never skipped by ``_row_id``/uid
+    alone: its content changed and the row-addressed rewrite must run. Lone
+    ``_row_id``/uid without a history boundary is left for the store's
+    byte-identical guard, so a parent id carried onto a rotation/branch
+    child still inserts.
+    """
     seed_ids = _db_flush_seed_ids(agent)
     history_ids = {id(item) for item in (conversation_history or []) if isinstance(item, dict)}
+    history_row_ids, history_uids, history_content_keys = _history_identity_sets(conversation_history)
     ov_idx = getattr(agent, "_persist_user_message_idx", None)
     # Also match the staged CLI dict by identity — the close safety-net may flush a shortened snapshot whose
     # turn index refers to the full history.
@@ -267,6 +377,21 @@ def _db_flush_collect(agent, messages: List[Dict], conversation_history: Optiona
             continue
         # Already durable (history copy or caller-seeded): stamp so future flushes skip it.
         is_history = id(msg) in history_ids
+        if not is_history and not replay_history:
+            content_key = _flush_content_key(msg)
+            if content_key is not None and content_key in history_content_keys:
+                is_history = True
+            elif isinstance(msg.get(DB_ROW_SNAPSHOT), str):
+                # A live dict awaiting a row-addressed rewrite: content changed,
+                # so _row_id/uid alone must not skip it.
+                pass
+            else:
+                row_id = msg.get("_row_id")
+                uid = message_uid_or_none(msg)
+                if _is_int_row_id(row_id) and row_id in history_row_ids:
+                    is_history = True
+                elif uid is not None and uid in history_uids:
+                    is_history = True
         if (
             (is_history and not replay_history) or id(msg) in seed_ids
         ) and not msg.get(_PERSIST_AFTER_ADMISSION_INTERRUPT):
