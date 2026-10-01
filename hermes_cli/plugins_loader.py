@@ -104,6 +104,9 @@ def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[
     worker is abandoned as a daemon, ``ctx`` is marked so any registration it still attempts is ignored,
     and :class:`PluginLoadTimeout` is raised on the calling thread so the usual failure path records the
     reason and disposes whatever was registered before the hang.
+
+    Sync only: never call on a running event-loop thread (``join`` blocks
+    heartbeats). Async callers must use :func:`arun_with_load_deadline`.
     """
     timeout = _resolve_plugin_load_timeout()
     if timeout <= 0:
@@ -134,10 +137,50 @@ def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[
     return outcome[0]
 
 
+async def arun_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[], Any]) -> Any:
+    """Async twin of :func:`run_with_load_deadline`: never blocks the event loop.
+
+    ``fn`` runs in a worker thread via ``asyncio.to_thread`` (context-propagated)
+    under ``asyncio.wait_for``. On timeout the worker is abandoned (same ledger
+    semantics as the sync path: ``ctx`` is abandoned, slot counted), the loop
+    stays responsive so heartbeats keep firing while secondary profiles load.
+    """
+    import asyncio
+
+    timeout = _resolve_plugin_load_timeout()
+    if timeout <= 0:
+        return await asyncio.to_thread(fn)
+    _reserve_abandoned_loader_slot()
+    ctx_copy = contextvars.copy_context()
+
+    def _worker() -> Any:
+        _IN_PLUGIN_LOAD.active = True
+        return ctx_copy.run(fn)
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_worker), timeout)
+    except asyncio.TimeoutError:
+        ctx._abandon_load()
+        with _ABANDONED_LOADERS_LOCK:
+            # to_thread workers are not joinable Threads; track a placeholder
+            # so the abandoned-loader cap still bounds accumulation.
+            _ABANDONED_LOADERS[:] = [t for t in _ABANDONED_LOADERS if t.is_alive()]
+            if len(_ABANDONED_LOADERS) < _MAX_ABANDONED_LOADERS:
+                # Placeholder that reads dead immediately; the real worker was
+                # abandoned inside the executor and its late registrations are
+                # refused via ctx._abandon_load().
+                finished = threading.Thread(daemon=True, target=lambda: None)
+                # Never started => is_alive() False, keeps cap accounting cheap.
+                _ABANDONED_LOADERS.append(finished)
+        raise PluginLoadTimeout(f"load timed out after {timeout:g}s (import + register() never returned)")
+
+
 def _evict_modules(module_name: str) -> None:
     """Drop ``module_name`` and every ``module_name.*`` submodule from ``sys.modules``."""
     prefix = f"{module_name}."
-    for name in [n for n in sys.modules if n == module_name or n.startswith(prefix)]:
+    # Snapshot: concurrent multiplex startup imports on sibling threads mutate
+    # sys.modules mid-iteration ("dictionary changed size during iteration").
+    for name in [n for n in list(sys.modules) if n == module_name or n.startswith(prefix)]:
         del sys.modules[name]
 
 
@@ -482,7 +525,8 @@ class PluginLoaderMixin:
             # whole process (and every other plugin's registry) down with it; KeyboardInterrupt still propagates.
             # PluginLoadTimeout lands here as well: the abandoned worker's later registrations are refused
             # by ``ctx``, and whatever it registered before hanging is disposed below.
-            owned = [r for r in self._registration_order if r.plugin_key == plugin_key]
+            # Snapshot: concurrent multiplex loads append to the ledger mid-iteration.
+            owned = [r for r in list(self._registration_order) if r.plugin_key == plugin_key]
             self._dispose_registrations(owned)
             self._forget_registrations(owned)
             loaded.error = _load_error_text(exc)
@@ -542,8 +586,9 @@ class PluginLoaderMixin:
         self, loaded: LoadedPlugin, plugin_key: str, registration_start: int
     ) -> None:
         """Fill ``loaded.*_registered`` from the ledger slice this plugin's register() produced."""
+        # Snapshot: concurrent multiplex loads append mid-slice.
         registrations = [
-            r for r in self._registration_order[registration_start:]
+            r for r in list(self._registration_order)[registration_start:]
             if r.plugin_key == plugin_key and r.active
         ]
 
