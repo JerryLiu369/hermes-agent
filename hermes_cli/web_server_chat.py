@@ -135,6 +135,12 @@ async def _legacy_pump(ws: "WebSocket", bridge) -> None:
 # loopback so tests don't need to rewrite request scope.
 _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1", "localhost", "testclient"})
 
+# Real loopback hosts a Desktop renderer Origin may carry
+# (``http://127.0.0.1:<port>``, ``http://localhost:<port>``,
+# ``http://[::1]:<port>``). Deliberately excludes the ``testclient`` peer
+# sentinel above — that is a test-harness value, never a renderer origin.
+_DESKTOP_RENDERER_LOOPBACK_ORIGINS = frozenset({"127.0.0.1", "localhost", "::1"})
+
 
 def _ws_client_reason(ws: "WebSocket") -> Optional[str]:
     """Return a rejection reason token for the peer IP, or None when allowed.
@@ -170,7 +176,15 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
     HTTP middleware does not run for WebSocket routes, so the DNS-rebinding
     Host check is repeated here; an Origin header, when present, must target the
     bound host.  Non-web origins (packaged Electron: file://, null, app://) are
-    trusted — the credential check is the real auth boundary there.
+    trusted — the credential check is the real auth boundary there.  Loopback
+    http(s) origins are trusted on the same basis: the Desktop renderer is
+    served from loopback HTTP even when packaged
+    (``http://127.0.0.1:<port>``), so a remote Tailscale/LAN bind can never
+    match it against the bound host (#130710, #130277).  A loopback origin
+    cannot be forged cross-site (a DNS-rebinding page keeps the attacker's
+    host as its Origin), and the WS credential validated before this guard
+    remains the auth boundary.  Non-loopback http(s) origins still must match
+    the bound host.
     """
     from hermes_cli.web_server import _is_accepted_host, app
     bound_host = getattr(app.state, "bound_host", None)
@@ -185,6 +199,17 @@ def _ws_host_origin_reason(ws: "WebSocket") -> Optional[str]:
         return None
     parsed = urllib.parse.urlparse(origin)
     if parsed.scheme not in {"http", "https"}:
+        return None
+    # The Desktop UI origin: http(s) on loopback (127.0.0.1, localhost, ::1,
+    # any port). Deliberately not the ``testclient`` peer sentinel — that is
+    # a test harness value, never a real renderer origin. A dotted-suffix
+    # forgery such as ``127.0.0.1.evil.test`` does not equal a loopback host
+    # and still falls through to the bound-host match below.
+    try:
+        origin_host = (parsed.hostname or "").lower()
+    except Exception:
+        origin_host = ""
+    if origin_host in _DESKTOP_RENDERER_LOOPBACK_ORIGINS:
         return None
     if not parsed.netloc or not _is_accepted_host(parsed.netloc, bound_host, trusted_public_hosts):
         return f"origin_mismatch origin={origin} bound={bound_host}"

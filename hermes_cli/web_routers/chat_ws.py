@@ -20,8 +20,7 @@ from hermes_cli.pty_session import RegistryFull
 from hermes_cli.web_deps import LateState, late
 from hermes_cli.web_routers.chat_ws_errors import chat_start_failure_message
 from hermes_cli.web_server_chat import (
-    _build_sidecar_url, _close_stalled_pty_input, _get_console_executor, _legacy_pump, _ws_auth_ok,
-    _ws_request_is_allowed,
+    _build_sidecar_url, _close_stalled_pty_input, _get_console_executor, _legacy_pump,
 )
 
 _log = logging.getLogger("hermes_cli.web_server")
@@ -138,14 +137,32 @@ async def _ws_gate(ws: WebSocket, kind: str) -> Optional[tuple[str, str, str]]:
 
 async def _close_unless_sidecar_allowed(ws: WebSocket) -> bool:
     """Pre-accept gates for the /api/ws, /api/pub and /api/events sidecars:
-    4403 when chat is disabled or the request isn't allowed, 4401 on bad auth."""
+    4403 when chat is disabled or the request isn't allowed, 4401 on bad auth.
+
+    Logs every pre-accept refusal with its reason — without this the renderer
+    reports only ``WebSocket error before open`` while the backend logs
+    nothing, leaving an ``origin_mismatch`` on a remote bind invisible on both
+    sides (#130710). Mirrors the ``_ws_gate`` logging for /api/console and
+    /api/pty; close codes are unchanged.
+    """
+    peer = ws.client.host if ws.client else "?"
     if not _DASHBOARD_EMBEDDED_CHAT_ENABLED:
+        _log.info("sidecar refused: embedded chat disabled peer=%s", peer)
         await ws.close(code=4403)
         return False
-    if not _ws_auth_ok(ws):
+    auth_reason, cred = _ws_auth_reason(ws)
+    if auth_reason is not None:
+        _log.warning("sidecar auth rejected reason=%s cred=%s peer=%s", auth_reason, cred, peer)
         await ws.close(code=4401)
         return False
-    if not _ws_request_is_allowed(ws):
+    host_origin_reason = _ws_host_origin_reason(ws)
+    if host_origin_reason is not None:
+        _log.warning("sidecar refused: %s peer=%s", host_origin_reason, peer)
+        await ws.close(code=4403)
+        return False
+    client_reason = _ws_client_reason(ws)
+    if client_reason is not None:
+        _log.warning("sidecar refused: %s peer=%s", client_reason, peer)
         await ws.close(code=4403)
         return False
     return True
