@@ -1,9 +1,8 @@
-"""Windows Store python alias detection (#129102).
+"""Windows Store python alias detection (#129102, #129121).
 
-``windows_store_python_stubs`` takes resolved paths as data so these tests run
-on any host without faking the OS. The one ``platforms("windows")`` test below
-drives the real ``shutil.which`` results on a genuine Windows runner (CI OS
-lane / wine2e) as the live receipt.
+``windows_store_python_stubs`` takes resolved paths plus a filesystem size
+probe (mocked here; live on Windows). Host-independent except the two
+platform-gated tests: silence off Windows and the live ``which`` receipt.
 """
 import pytest
 
@@ -11,18 +10,36 @@ from hermes_cli import doctor_platform
 from hermes_cli.doctor_report import Finding
 
 
-def test_both_aliases_reported():
+def test_both_aliases_reported(monkeypatch):
+    import os
+
+    monkeypatch.setattr(os.path, "getsize", lambda _p: 0)
     assert doctor_platform.windows_store_python_stubs(
         r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\python.exe",
         r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\python3.exe",
     ) == ["python", "python3"]
 
 
-def test_msys_spelling_counts_as_alias():
+def test_msys_spelling_counts_as_alias(monkeypatch):
+    import os
+
+    monkeypatch.setattr(os.path, "getsize", lambda _p: 0)
     assert doctor_platform.windows_store_python_stubs(
         r"C:\Python314\python.exe",
         "/c/Users/u/AppData/Local/Microsoft/WindowsApps/python3",
     ) == ["python3"]
+
+
+def test_nonzero_windowsapps_shim_is_not_reported(monkeypatch):
+    """#129121: Python Install Manager-style shim under WindowsApps has
+    non-zero size — it is a real interpreter and must not be flagged."""
+    import os
+
+    monkeypatch.setattr(os.path, "getsize", lambda _p: 4096)
+    assert doctor_platform.windows_store_python_stubs(
+        r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\python.exe",
+        r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\python3.exe",
+    ) == []
 
 
 def test_real_interpreters_are_not_reported():
@@ -33,9 +50,10 @@ def test_real_interpreters_are_not_reported():
     assert doctor_platform.windows_store_python_stubs(None, None) == []
 
 
+@pytest.mark.platforms("not windows")
 def test_check_is_silent_off_windows(capsys):
-    """The win32-gated check stays silent on this (Linux) host without faking
-    the platform — it must never warn here."""
+    """The win32-gated check stays silent off Windows — skipped on win32
+    where the live probe runs (see the windows-only live test below)."""
     f = Finding()
     doctor_platform._check_windows_store_python_aliases(f)
     assert capsys.readouterr().out == ""

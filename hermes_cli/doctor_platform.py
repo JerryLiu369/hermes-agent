@@ -429,8 +429,10 @@ def _staged_venv_dir() -> "Path | None":
 
 def windows_store_python_stubs(python_path: str | None, python3_path: str | None) -> list[str]:
     """Names among (``python``, ``python3``) whose resolved path is a Microsoft
-    Store App Execution Alias (#129102). Pure path data so it is testable
-    without faking the host OS; the ``win32`` gate lives in the caller."""
+    Store App Execution Alias (#129102, #129121). A ``WindowsApps`` path only
+    counts when it is a 0-byte stub or a dead redirector — a non-zero
+    ``WindowsApps`` binary (e.g. the Python Install Manager shim) is a real
+    interpreter. The ``win32`` gate lives in the caller."""
     from pm.shell import is_windows_app_alias
 
     stubs = []
