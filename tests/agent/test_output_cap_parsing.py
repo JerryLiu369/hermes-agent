@@ -278,3 +278,17 @@ class TestParseDirectComparisonOutputCaps:
     def test_direct_comparison_is_output_cap(self, msg):
         assert is_output_cap_error(msg) is True
 
+    @pytest.mark.parametrize("msg", [
+        "temperature cannot be greater than 2",
+        "top_p cannot be greater than 1",
+        "temperature exceeds the limit of 2",
+        "top_p exceeds the limit of 1",
+        "temperature is greater than the maximum of 2",
+        "top_p is greater than the maximum of 1",
+        "Invalid value for 'temperature': temperature cannot be greater than 2",
+        "Invalid value for 'top_p': top_p cannot be greater than 1",
+    ])
+    def test_non_token_fields_are_not_output_cap(self, msg):
+        assert parse_available_output_tokens_from_error(msg) is None
+        assert is_output_cap_error(msg) is False
+
