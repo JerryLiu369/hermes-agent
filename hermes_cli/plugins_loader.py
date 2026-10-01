@@ -54,6 +54,53 @@ _IN_PLUGIN_LOAD_CTX: contextvars.ContextVar[bool] = contextvars.ContextVar(
 )
 
 
+class _PluginLoadScope:
+    """Shared abandonment scope for one outermost load chain.
+
+    Each scoped plugin load creates a distinct ``PluginContext``, so abandoning only the outer
+    context leaves a nested context live: if the nested function resumes after the outer timeout,
+    its registrations land after the caller already recorded a failed load. Every context in the
+    chain joins this scope; the outer timeout abandons all of them, and a context that joins an
+    already-abandoned scope is fenced immediately.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._contexts: List[Any] = []
+        self.abandoned = False
+
+    def add(self, ctx: Any) -> None:
+        """Track ``ctx``; fence it at once when the scope already timed out."""
+        if ctx is None:
+            return
+        abandon_now = False
+        with self._lock:
+            if not any(existing is ctx for existing in self._contexts):
+                self._contexts.append(ctx)
+            abandon_now = self.abandoned
+        if abandon_now:
+            try:
+                ctx._abandon_load()
+            except Exception:
+                pass
+
+    def abandon(self) -> None:
+        """Abandon every tracked context; fence every later joiner."""
+        with self._lock:
+            self.abandoned = True
+            contexts = list(self._contexts)
+        for ctx in contexts:
+            try:
+                ctx._abandon_load()
+            except Exception:
+                pass
+
+
+_PLUGIN_LOAD_SCOPE_CTX: contextvars.ContextVar[Optional[_PluginLoadScope]] = contextvars.ContextVar(
+    "hermes_plugin_load_scope", default=None,
+)
+
+
 class PluginLoadTimeout(Exception):
     """Raised on the loading thread when a plugin's import + ``register()`` overran its deadline."""
 
@@ -118,14 +165,22 @@ def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[
     Re-entrant calls from inside a plugin load (a ``register()`` that triggers another plugin load,
     e.g. via i18n/YAML -> platform registry -> deferred loader, #130575) run ``fn()`` inline on the
     current thread: spawning another deadline worker and joining it would deadlock against the outer
-    worker's join (and against the discovery lock the loading thread holds while waiting).
+    worker's join (and against the discovery lock the loading thread holds while waiting). The
+    nested context still joins the outer load's shared abandonment scope, so an outer timeout
+    fences every nested context even though each scoped load owns a distinct ``PluginContext``.
     """
+    scope = _PLUGIN_LOAD_SCOPE_CTX.get()
     if _in_plugin_load():
+        if scope is not None:
+            scope.add(ctx)
         return fn()
     timeout = _resolve_plugin_load_timeout()
     if timeout <= 0:
         return fn()
     _reserve_abandoned_loader_slot()
+    scope = _PluginLoadScope()
+    scope.add(ctx)
+    scope_token = _PLUGIN_LOAD_SCOPE_CTX.set(scope)
     outcome: List[Any] = []
     failure: List[BaseException] = []
 
@@ -140,19 +195,22 @@ def run_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Callable[[
             _IN_PLUGIN_LOAD.active = False
             _IN_PLUGIN_LOAD_CTX.reset(token)
 
-    worker = threading.Thread(
-        target=contextvars.copy_context().run, args=(_worker,), name=f"plugin-load:{plugin_key}", daemon=True,
-    )
-    worker.start()
-    worker.join(timeout)
-    if worker.is_alive():
-        ctx._abandon_load()
-        with _ABANDONED_LOADERS_LOCK:
-            _ABANDONED_LOADERS.append(worker)
-        raise PluginLoadTimeout(f"load timed out after {timeout:g}s (import + register() never returned)")
-    if failure:
-        raise failure[0]
-    return outcome[0]
+    try:
+        worker = threading.Thread(
+            target=contextvars.copy_context().run, args=(_worker,), name=f"plugin-load:{plugin_key}", daemon=True,
+        )
+        worker.start()
+        worker.join(timeout)
+        if worker.is_alive():
+            scope.abandon()
+            with _ABANDONED_LOADERS_LOCK:
+                _ABANDONED_LOADERS.append(worker)
+            raise PluginLoadTimeout(f"load timed out after {timeout:g}s (import + register() never returned)")
+        if failure:
+            raise failure[0]
+        return outcome[0]
+    finally:
+        _PLUGIN_LOAD_SCOPE_CTX.reset(scope_token)
 
 
 def _evict_modules(module_name: str) -> None:

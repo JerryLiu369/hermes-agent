@@ -55,11 +55,13 @@ def clean_guard():
     """Each test starts and ends outside a plugin load."""
     _IN_PLUGIN_LOAD.active = False
     token = _IN_PLUGIN_LOAD_CTX.set(False)
+    scope_token = loader._PLUGIN_LOAD_SCOPE_CTX.set(None)
     try:
         yield
     finally:
         _IN_PLUGIN_LOAD.active = False
         _IN_PLUGIN_LOAD_CTX.reset(token)
+        loader._PLUGIN_LOAD_SCOPE_CTX.reset(scope_token)
 
 
 def test_nested_deadline_runs_inline_on_same_thread(monkeypatch, isolated_loaders):
@@ -247,3 +249,64 @@ def test_contextvar_guard_alone_runs_inline(monkeypatch, isolated_loaders):
     finally:
         _IN_PLUGIN_LOAD_CTX.reset(token)
     assert not _in_plugin_load()
+
+
+def test_outer_timeout_abandons_nested_context(monkeypatch, isolated_loaders):
+    """An outer timeout must fence every nested context in the same load chain.
+
+    Each scoped load owns a distinct ``PluginContext``; abandoning only the outer one leaves the
+    nested context live, so a nested function that resumes after the outer timeout can still
+    register after the caller recorded a failed load.
+    """
+    from hermes_cli.plugins import PluginContext
+
+    monkeypatch.setattr(loader, "_resolve_plugin_load_timeout", lambda: 0.2)
+    calls = []
+    manager = SimpleNamespace(
+        _subscribe_event=lambda plugin_id, event, cb: calls.append((plugin_id, event)),
+        scope_key="test",
+    )
+    outer_ctx = PluginContext(
+        SimpleNamespace(name="outer", key="outer", skill_namespace="outer"), manager,
+    )
+    nested_ctx = PluginContext(
+        SimpleNamespace(name="nested", key="nested", skill_namespace="nested"), manager,
+    )
+    release = threading.Event()
+    done = threading.Event()
+    late = {}
+
+    def nested_fn():
+        assert release.wait(10), "nested function was never released"
+        late["abandoned_at_resume"] = nested_ctx._load_abandoned
+        late["subscribe_return"] = nested_ctx.subscribe("nested:event", lambda: None)
+        late["abandoned_after"] = nested_ctx._load_abandoned
+        done.set()
+        return "nested-late"
+
+    def outer_fn():
+        return run_with_load_deadline("nested", nested_ctx, nested_fn)
+
+    with pytest.raises(PluginLoadTimeout):
+        run_with_load_deadline("outer", outer_ctx, outer_fn)
+
+    assert outer_ctx._load_abandoned is True
+    # The nested context joined the shared scope before blocking, so the outer
+    # timeout fenced it as well — before it ever resumed.
+    assert nested_ctx._load_abandoned is True
+    release.set()
+    assert done.wait(5), "abandoned nested worker never resumed"
+    assert late["abandoned_at_resume"] is True
+    assert late["abandoned_after"] is True
+    assert late["subscribe_return"] is None
+    assert calls == []
+
+
+def test_nested_context_joining_abandoned_scope_is_fenced_immediately():
+    """A context that joins after the outer timeout is abandoned at once."""
+    late_ctx, late_abandoned = _ctx()
+    scope = loader._PluginLoadScope()
+    scope.abandon()
+    scope.add(late_ctx)
+    assert late_abandoned["flag"] is True
+    assert scope.abandoned is True
