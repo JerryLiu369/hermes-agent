@@ -2954,9 +2954,23 @@ def _adopt_grown_durable_parent(agent: Any, lease: _CompressionLease, messages: 
         )
         return None
     # Re-read after the flush so the adopted snapshot carries the just-persisted tail.
-    durable_parent = durable_loader(lease.db, lease.sid)
+    try:
+        durable_parent = durable_loader(lease.db, lease.sid, include_row_ids=True)
+    except TypeError:
+        durable_parent = durable_loader(lease.db, lease.sid)
     if not (isinstance(durable_parent, list) and len(durable_parent) > len(messages)):
         return None
+    _adopted_max_id = max(
+        (m.pop("_row_id", 0) or 0 for m in durable_parent if isinstance(m, dict)),
+        default=0,
+    )
+    if _adopted_max_id == 0 and hasattr(lease.db, "get_active_message_watermark"):
+        with contextlib.suppress(Exception):
+            _active_wm = lease.db.get_active_message_watermark(lease.sid)
+            if _active_wm is not None:
+                _adopted_max_id = _active_wm
+    if lease.watermark is not None and _adopted_max_id > lease.watermark:
+        lease.watermark = _adopted_max_id  # adopted rows are in the handoff; only later rows are foreign tail
     logger.info(
         "compression: session=%s grew before lease (%d → %d msgs); adopting durable snapshot", lease.sid, len(messages),
         len(durable_parent),

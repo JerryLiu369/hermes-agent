@@ -25,12 +25,14 @@ summarizer instead.
 
 from __future__ import annotations
 
+import copy
 import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
+from agent.context_compressor import _DB_PERSISTED_MARKER
 from hermes_state import SessionDB
 
 
@@ -210,3 +212,76 @@ def test_adoption_skipped_when_preflush_fails_keeps_live_input(
         "dropped from the summary. "
         f"Compress input contents: {_contents(compress_input)!r}"
     )
+
+
+def test_adoption_rotation_does_not_duplicate_live_user_prompt_in_child(
+    tmp_path: Path,
+) -> None:
+    """#125888: Rotating after durable-snapshot adoption must not write the
+    live user prompt into the child session twice.
+
+    The prompt is in the compressor's verbatim tail handoff. The adoption
+    re-read advances the lease watermark to the adopted snapshot's highest id
+    so pre-adoption parent rows are not classified as foreign tail.
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent, messages = _seed_drifted_session(db, "PREFLIGHT_ADOPT_NO_DUP")
+
+    def _compress_with_verbatim_tail(msgs, **_kw):
+        tail = [
+            {
+                k: v
+                for k, v in copy.deepcopy(m).items()
+                if k not in (_DB_PERSISTED_MARKER, "_row_id")
+            }
+            for m in msgs[-2:]
+        ]
+        return [{"role": "user", "content": "[CONTEXT COMPACTION] summary"}, *tail]
+
+    agent.context_compressor.compress.side_effect = _compress_with_verbatim_tail
+    agent._compress_context(messages, "sys", approx_tokens=120_000)
+
+    child_rows = db.get_messages_as_conversation(agent.session_id)
+    child_contents = _contents(child_rows)
+    assert child_contents == [
+        "[CONTEXT COMPACTION] summary",
+        "concurrent row 2",
+        "LIVE USER INSTRUCTION",
+    ], f"Live prompt should appear exactly once in child session, got {child_contents!r}"
+
+
+def test_adoption_rotation_still_clones_post_adoption_foreign_append(
+    tmp_path: Path,
+) -> None:
+    """#125888: Foreign rows appended during the summarizer run (after adoption)
+    have id > watermark and must still be cloned into the child session.
+    """
+    db = SessionDB(db_path=tmp_path / "state.db")
+    agent, messages = _seed_drifted_session(db, "PREFLIGHT_ADOPT_CONCURRENT")
+
+    def _compress_with_concurrent_append(msgs, **_kw):
+        db.append_message(
+            "PREFLIGHT_ADOPT_CONCURRENT", "user", "foreign post-adoption append"
+        )
+        tail = [
+            {
+                k: v
+                for k, v in copy.deepcopy(m).items()
+                if k not in (_DB_PERSISTED_MARKER, "_row_id")
+            }
+            for m in msgs[-2:]
+        ]
+        return [{"role": "user", "content": "[CONTEXT COMPACTION] summary"}, *tail]
+
+    agent.context_compressor.compress.side_effect = _compress_with_concurrent_append
+    agent._compress_context(messages, "sys", approx_tokens=120_000)
+
+    child_rows = db.get_messages_as_conversation(agent.session_id)
+    child_contents = _contents(child_rows)
+    assert child_contents == [
+        "[CONTEXT COMPACTION] summary",
+        "concurrent row 2",
+        "LIVE USER INSTRUCTION",
+        "foreign post-adoption append",
+    ], f"Child should contain handoff and cloned foreign append, got {child_contents!r}"
+
