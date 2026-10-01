@@ -266,15 +266,74 @@ def test_reap_skips_current_socket_even_when_owner_dead(monkeypatch, tmp_path):
     assert os.path.exists(current)
 
 
-def test_reap_still_cleans_when_stop_raises(monkeypatch, tmp_path):
+def test_reap_retains_candidate_when_stop_fails(monkeypatch, tmp_path):
     _patch_tempdir(monkeypatch, tmp_path)
     sock, marker = _write_sock_and_marker(tmp_path, "hc-orphan.sock", DEAD_PID, 1)
     calls = []
     _patch_run_quiet(monkeypatch, calls, raising=RuntimeError("boom"))
-    # Must not raise, and must still unlink the stale files.
+    # Must not raise, and must NOT unlink: a failed stop destroys the only retry
+    # handle while the daemon may still be alive, so the candidate is retained
+    # (no independent proof of death) for a future startup to retry.
+    daemon_mod._reap_orphaned_embedded_daemons("/fake/cua-driver", "/none/current.sock", env={})
+    assert os.path.exists(sock)
+    assert os.path.exists(marker)
+
+
+def _patch_run_quiet_per_verb(monkeypatch, calls, stop_result="ok", status_result="dead"):
+    """Fake _run_quiet with independent stop/status outcomes.
+
+    stop_result/status_result: "ok" (returncode 0), "fail" (returncode 1),
+    "unknown" (return None, swallowed probe error), or an Exception to raise.
+    """
+    def _result(kind):
+        outcome = stop_result if kind == "stop" else status_result
+        if isinstance(outcome, BaseException):
+            raise outcome
+        if outcome == "ok":
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        if outcome == "fail":
+            return types.SimpleNamespace(returncode=1, stdout="not running", stderr="")
+        if outcome == "unknown":
+            return None
+        raise AssertionError(f"unknown outcome {outcome!r}")
+
+    def fake(argv, *, timeout=0, **kw):
+        calls.append(list(argv))
+        kind = "stop" if len(argv) > 1 and argv[1] == "stop" else "status"
+        return _result(kind)
+
+    fake_cb = types.SimpleNamespace(_run_quiet=fake)
+    monkeypatch.setattr(daemon_mod, "_cb", lambda: fake_cb)
+
+
+def test_reap_cleans_when_stop_fails_but_status_confirms_dead(monkeypatch, tmp_path):
+    _patch_tempdir(monkeypatch, tmp_path)
+    sock, marker = _write_sock_and_marker(tmp_path, "hc-orphan.sock", DEAD_PID, 1)
+    calls = []
+    _patch_run_quiet_per_verb(monkeypatch, calls, stop_result=RuntimeError("boom"), status_result="fail")
     daemon_mod._reap_orphaned_embedded_daemons("/fake/cua-driver", "/none/current.sock", env={})
     assert not os.path.exists(sock)
     assert not os.path.exists(marker)
+
+
+def test_reap_retains_when_stop_fails_and_status_live(monkeypatch, tmp_path):
+    _patch_tempdir(monkeypatch, tmp_path)
+    sock, marker = _write_sock_and_marker(tmp_path, "hc-orphan.sock", DEAD_PID, 1)
+    calls = []
+    _patch_run_quiet_per_verb(monkeypatch, calls, stop_result="fail", status_result="ok")
+    daemon_mod._reap_orphaned_embedded_daemons("/fake/cua-driver", "/none/current.sock", env={})
+    assert os.path.exists(sock)
+    assert os.path.exists(marker)
+
+
+def test_reap_retains_when_status_probe_inconclusive(monkeypatch, tmp_path):
+    _patch_tempdir(monkeypatch, tmp_path)
+    sock, marker = _write_sock_and_marker(tmp_path, "hc-orphan.sock", DEAD_PID, 1)
+    calls = []
+    _patch_run_quiet_per_verb(monkeypatch, calls, stop_result="fail", status_result="unknown")
+    daemon_mod._reap_orphaned_embedded_daemons("/fake/cua-driver", "/none/current.sock", env={})
+    assert os.path.exists(sock)
+    assert os.path.exists(marker)
 
 
 def test_reap_scan_failure_never_raises(monkeypatch):
@@ -430,4 +489,89 @@ def test_stop_without_runtime_still_cleans_marker(monkeypatch, tmp_path):
     d._owns_runtime = False
     d._process = None
     d.stop()
+    assert not os.path.exists(d.owner_marker_path)
+
+
+# --- start() prepublishes provenance -------------------------------------------
+
+
+def test_start_prepublishes_owner_marker_before_launch(monkeypatch, tmp_path):
+    d = _make_daemon(monkeypatch, tmp_path)
+    _patch_startup(monkeypatch, d)
+    calls = []
+    _patch_run_quiet(monkeypatch, calls)
+    assert not os.path.exists(d.owner_marker_path)
+    seen = {}
+
+    def _RecordingPopen(*args, **kwargs):
+        seen["marker_at_launch"] = os.path.exists(d.owner_marker_path)
+        return _FakePopen(*args, **kwargs)
+
+    monkeypatch.setattr(daemon_mod.subprocess, "Popen", _RecordingPopen)
+    d.start()
+    try:
+        assert seen.get("marker_at_launch") is True
+        assert os.path.exists(d.owner_marker_path)
+    finally:
+        with open(d.socket_path, "w", encoding="utf-8"):
+            pass
+        d.stop()
+
+
+def test_start_cleans_prepublished_marker_when_launch_fails(monkeypatch, tmp_path):
+    from tools.computer_use import cua_backend_driver as driver_mod
+
+    d = _make_daemon(monkeypatch, tmp_path)
+    monkeypatch.setattr(driver_mod, "_resolve_mcp_invocation", lambda cmd: (cmd, ["mcp"]))
+    monkeypatch.setattr(d, "_sanitized_env", lambda: {})
+    monkeypatch.setattr(d, "_socket_ready", lambda env: True)
+    monkeypatch.setattr(daemon_mod, "_wait_or_kill", lambda proc: None)
+    calls = []
+    _patch_run_quiet(monkeypatch, calls)
+
+    def _BoomPopen(*args, **kwargs):
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(daemon_mod.subprocess, "Popen", _BoomPopen)
+    with pytest.raises(OSError, match="spawn failed"):
+        d.start()
+    assert not os.path.exists(d.owner_marker_path)
+    assert d._process is None
+
+
+def test_start_cleans_prepublished_marker_on_startup_timeout(monkeypatch, tmp_path):
+    from tools.computer_use import cua_backend_driver as driver_mod
+
+    d = _make_daemon(monkeypatch, tmp_path)
+    monkeypatch.setattr(driver_mod, "_resolve_mcp_invocation", lambda cmd: (cmd, ["mcp"]))
+    monkeypatch.setattr(d, "_sanitized_env", lambda: {})
+    monkeypatch.setattr(d, "_socket_ready", lambda env: False)
+    monkeypatch.setattr(daemon_mod.subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(daemon_mod, "_wait_or_kill", lambda proc: None)
+    monkeypatch.setattr(d, "_START_TIMEOUT_SECONDS", 0.2)
+    calls = []
+    _patch_run_quiet(monkeypatch, calls)
+    with pytest.raises(RuntimeError, match="timed out"):
+        d.start()
+    assert not os.path.exists(d.owner_marker_path)
+
+
+class _FakeDeadPopen(_FakePopen):
+    def poll(self):
+        return 1
+
+
+def test_start_cleans_prepublished_marker_on_early_exit(monkeypatch, tmp_path):
+    from tools.computer_use import cua_backend_driver as driver_mod
+
+    d = _make_daemon(monkeypatch, tmp_path)
+    monkeypatch.setattr(driver_mod, "_resolve_mcp_invocation", lambda cmd: (cmd, ["mcp"]))
+    monkeypatch.setattr(d, "_sanitized_env", lambda: {})
+    monkeypatch.setattr(d, "_socket_ready", lambda env: False)
+    monkeypatch.setattr(daemon_mod.subprocess, "Popen", _FakeDeadPopen)
+    monkeypatch.setattr(daemon_mod, "_wait_or_kill", lambda proc: None)
+    calls = []
+    _patch_run_quiet(monkeypatch, calls)
+    with pytest.raises(RuntimeError, match="exited during startup"):
+        d.start()
     assert not os.path.exists(d.owner_marker_path)

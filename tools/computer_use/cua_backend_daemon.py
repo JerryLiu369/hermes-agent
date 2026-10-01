@@ -197,8 +197,9 @@ def _reap_orphaned_embedded_daemons(
                 continue
             if not _is_owner_dead(record.get("pid"), record.get("start_time")):
                 continue
-            with contextlib.suppress(Exception):
-                _cb()._run_quiet(
+            stopped = False
+            try:
+                stop_proc = _cb()._run_quiet(
                     [driver_cmd, "stop", "--socket", sock_path],
                     timeout=3.0,
                     stdout=subprocess.DEVNULL,
@@ -206,6 +207,29 @@ def _reap_orphaned_embedded_daemons(
                     env=env,
                     swallow=_QUIET_ERRORS,
                 )
+                stopped = stop_proc is not None and stop_proc.returncode == 0
+            except Exception as exc:
+                logger.debug("embedded cua-driver: stop failed for %s: %s", sock_path, exc)
+                stopped = False
+            if not stopped:
+                # A failed stop must not retire the only retry handle: confirm death
+                # with an independent status probe, retaining on live/unknown.
+                try:
+                    status_proc = _cb()._run_quiet(
+                        [driver_cmd, "status", "--socket", sock_path],
+                        timeout=3.0,
+                        env=env,
+                        swallow=_QUIET_ERRORS,
+                    )
+                except Exception as exc:
+                    logger.debug("embedded cua-driver: status probe failed for %s: %s", sock_path, exc)
+                    continue
+                if status_proc is None or getattr(status_proc, "returncode", None) == 0:
+                    logger.debug(
+                        "embedded cua-driver: retaining %s (stop failed, daemon live or probe inconclusive)",
+                        sock_path,
+                    )
+                    continue
             with contextlib.suppress(OSError):
                 os.remove(sock_path)
             with contextlib.suppress(OSError):
@@ -298,9 +322,18 @@ class _EmbeddedCuaDaemon:
         with contextlib.suppress(Exception):
             self._reap_orphans(env)
         command = _embedded_daemon_spawn_command(self._command, self._serve_args(), platform=sys.platform)
-        self._process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
-                                         env=env)
+        # Prepublish provenance before the detached daemon can become live: on macOS
+        # `open -n -g -a` reparents to launchd, so the daemon may outlive this process
+        # before the socket is ready. Best-effort, never raises.
+        with contextlib.suppress(Exception):
+            _write_owner_marker(self.socket_path)
+        try:
+            self._process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace",
+                                             env=env)
+        except Exception:
+            _remove_owner_marker(self.socket_path)
+            raise
         self._owns_runtime = True
         threading.Thread(target=self._drain_stderr, args=(self._process,), name="hermes-cua-daemon-stderr", daemon=True).start()
         deadline = time.monotonic() + self._START_TIMEOUT_SECONDS
@@ -308,11 +341,10 @@ class _EmbeddedCuaDaemon:
             return_code = self._process.poll()
             # `open` exits 0 once LaunchServices took the request: on macOS only a non-zero exit means the daemon died.
             if return_code is not None and (sys.platform != "darwin" or return_code != 0):
+                self.stop()
                 self._startup_failure("embedded cua-driver exited during startup", "no diagnostic output")
             if self._socket_ready(env):
                 self._running = True
-                with contextlib.suppress(Exception):
-                    _write_owner_marker(self.socket_path)
                 return
             time.sleep(0.1)
         self.stop()
