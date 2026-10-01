@@ -210,7 +210,8 @@ async function locateHermes(ssh, remoteHermesPath) {
   const isExecutable = async (candidate: string) => {
     try {
       validateRemotePath(candidate)
-      const ok = (await ssh.exec(`[ -x ${expandRemotePath(candidate)} ] && echo OK || true`)).trim()
+      const quoted = expandRemotePath(candidate)
+      const ok = (await ssh.exec(`[ -f ${quoted} ] && [ -x ${quoted} ] && echo OK || true`)).trim()
 
       return ok === 'OK'
     } catch {
@@ -219,6 +220,27 @@ async function locateHermes(ssh, remoteHermesPath) {
   }
 
   if (remoteHermesPath) {
+    try {
+      const dirProbe = (
+        await ssh.exec(`[ -d ${expandRemotePath(remoteHermesPath)} ] && echo DIR || true`)
+      ).trim()
+
+      if (dirProbe === 'DIR') {
+        const err: any = new Error(
+          `The Hermes path set for this connection is a directory, not an executable: "${remoteHermesPath}". Set it to the remote \`hermes\` binary (e.g. ~/.local/bin/hermes), or clear the field to auto-detect.`
+        )
+
+        err.kind = 'hermes-not-found'
+        throw err
+      }
+    } catch (probeError: any) {
+      if (probeError?.kind === 'hermes-not-found') {
+        throw probeError
+      }
+      // Ignore directory-probe transport/validation failures and fall through
+      // to the executable check, which produces the generic not-found error.
+    }
+
     if (await isExecutable(remoteHermesPath)) {
       return resolveLauncher(remoteHermesPath)
     }

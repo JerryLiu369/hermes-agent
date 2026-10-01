@@ -428,6 +428,45 @@ test('locateHermes uses a login shell for the command -v probe', async () => {
   )
 })
 
+test('locateHermes rejects an explicit path that is a directory, naming it', async () => {
+  const dirPath = '~/.hermes/hermes-agent'
+  const ssh = fakeSsh([
+    [/\[ -d/, 'DIR'],
+    // Even if the executable probe would pass (a directory satisfies bare
+    // `[ -x ]`), the directory check must win with its own descriptive error.
+    [/\[ -f/, 'OK']
+  ])
+
+  await assert.rejects(
+    () => locateHermes(ssh, dirPath),
+    (err: any) => {
+      assert.equal(err.kind, 'hermes-not-found')
+      assert.match(err.message, /is a directory/)
+      assert.ok(err.message.includes(dirPath), `error must name the directory: ${err.message}`)
+
+      return true
+    }
+  )
+  assert.ok(ssh.calls.some(c => /\[ -d /.test(c)), 'must probe whether the explicit path is a directory')
+})
+
+test('locateHermes skips an auto-detect candidate that is a directory', async () => {
+  // Simulate POSIX: a directory passes bare `[ -x ]` (old bug) but fails
+  // `[ -f ]` (fixed probe requires a regular file).
+  const ssh = fakeSsh([
+    [/command -v hermes/, '/home/u/hermes-dir\n'],
+    [(cmd: string) => cmd.includes('hermes-dir') && cmd.includes('[ -f'), ''],
+    [(cmd: string) => cmd.includes('hermes-dir'), 'OK'],
+    [/\[ -f .*\.local\/bin\/hermes/, 'OK']
+  ])
+
+  assert.equal(await locateHermes(ssh, ''), '~/.local/bin/hermes')
+  assert.ok(
+    ssh.calls.some(c => /\[ -f /.test(c) && /\[ -x /.test(c)),
+    'isExecutable must require a regular file ([ -f ] && [ -x ])'
+  )
+})
+
 test('probeRemotePlatform accepts Linux and macOS', async () => {
   assert.deepEqual(await probeRemotePlatform(fakeSsh([[/uname/, 'Linux\nx86_64']])), {
     os: 'Linux',
