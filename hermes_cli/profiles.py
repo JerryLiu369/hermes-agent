@@ -2128,16 +2128,92 @@ def _default_export_ignore(root_dir: Path):
         # Universal exclusions (any depth) plus npm lockfiles that can appear at root.
         ignored = _non_exportable_entries(directory, contents)
         ignored.update({"package.json", "package-lock.json"} & set(contents))
+        # Defense in depth: credential stores must never enter even an allowed
+        # subtree (e.g. a ``skills/`` dir carrying its own ``.env``).
+        ignored.update(entry for entry in contents if _is_export_credential_entry(entry))
         if Path(directory) == root_dir:
             ignored.update(entry for entry in contents if entry not in _DEFAULT_EXPORT_INCLUDE_ROOT)
+            ignored.update(entry for entry in contents if entry.lower() in _EXPORT_CREDENTIAL_ROOT_DIRS)
         return ignored
 
     return _ignore
 
 
-# Credential files dropped from named-profile exports. ``bot-desktop`` is the screen's runtime state:
+# Credential files dropped from named-profile exports (matched by basename at any
+# depth, case-insensitively). ``bot-desktop`` is the screen's runtime state:
 # its persistent Chromium profile (Cookies, Login Data — the bot's live web sessions), Xauthority, sockets.
-_EXPORT_CREDENTIAL_FILES = frozenset({"auth.json", ".env", "bot-desktop"})
+# This is the export-time counterpart of the read/write deny-lists in
+# ``agent/file_safety.py`` and ``gateway/platforms/base.py::_ROOT_CREDENTIAL_PATHS``:
+# every credential store Hermes reads from a profile home must be listed here,
+# or a "shareable; keys stripped" archive leaks it (issue #126114).
+_EXPORT_CREDENTIAL_FILES = frozenset({
+    # Core Hermes credential stores
+    "auth.json", "auth.lock", "credentials",
+    ".env", ".op.env",
+    ".anthropic_oauth.json",
+    # Package-registry auth Hermes reads from the profile home
+    # (``hermes_cli/source_build.py`` points ``NPM_CONFIG_USERCONFIG`` at ``<home>/npmrc``)
+    ".npmrc", "npmrc", ".pypirc",
+    # OS credential shims that may live under ``<profile>/home/``
+    ".netrc", ".pgpass", ".git-credentials",
+    # OAuth token stores (Google, Google Chat per-user, Slack, Bitwarden cache)
+    "google_oauth.json", "google_token.json", "google_oauth_pending.json",
+    "google_chat_user_token.json", "google_chat_user_client_secret.json",
+    "google_chat_user_oauth_pending.json",
+    "slack_tokens.json",
+    "bws_cache.json", "bws_cache.enc.json",
+    # HMAC / pairing secrets
+    "webhook_subscriptions.json",
+    "feishu_comment_pairing.json",
+    # Vault key + ciphertext (side by side == plaintext)
+    "vault.key", "vault.json.enc",
+    # Per-bot runtime identity (channel state, not persona)
+    "channel_directory.json", "channel_aliases.json",
+})
+
+# Credential directories dropped from exports (matched by dirname at any depth,
+# case-insensitively; the whole subtree is pruned). Distinctive names that cannot
+# collide with user skill/data directories.
+_EXPORT_CREDENTIAL_DIRS = frozenset({
+    "bot-desktop",
+    "mcp-tokens",
+    "pairing",
+    "vault",
+    "browser-profile",
+    "browser_auth",
+    "credentials",
+})
+
+# Credential-adjacent directories dropped only at the profile root. Generic names
+# that could collide with user data nested deeper (e.g. a skill subdir named
+# ``auth``), so they are pruned only as direct children of the profile home.
+# ``platforms/`` covers the new layout (``platforms/pairing/``,
+# ``platforms/whatsapp/session/``, ``platforms/matrix/store/``);
+# ``whatsapp/`` / ``matrix/`` cover the legacy layout.
+_EXPORT_CREDENTIAL_ROOT_DIRS = frozenset({
+    "platforms", "whatsapp", "matrix", "auth", "gateway",
+    "google_chat_user_tokens", "google_chat_user_oauth_pending",
+})
+
+
+def _is_export_credential_entry(name: str) -> bool:
+    """True when *name* (an immediate child basename) is credential material that
+    must never enter a profile export archive, at any depth."""
+    lowered = name.lower()
+    if lowered in _EXPORT_CREDENTIAL_FILES or lowered in _EXPORT_CREDENTIAL_DIRS:
+        return True
+    # Dotenv variants (``.env.local``, ``.env.development``, ...) — but keep the
+    # documented shape substitutes (``.env.example``, ``.env.template``).
+    if lowered == ".env" or (
+        lowered.startswith(".env.")
+        and not (lowered.endswith(".example") or lowered.endswith(".template"))
+    ):
+        return True
+    # Google Chat per-user OAuth stores (present + future): tokens dir, pending
+    # dir, token files, client secrets all share this prefix.
+    if lowered.startswith("google_chat_user_"):
+        return True
+    return False
 
 # Text/config suffixes secret-scrubbed on export; binary DBs, images etc. are left alone.
 _EXPORT_REDACT_SUFFIXES = frozenset({
@@ -2196,9 +2272,12 @@ def export_profile(name: str, output_path: str, extra_files: Optional[Dict[str, 
     # credential exclusion for named profiles.
     def _ignore_credentials(directory: str, contents: list) -> set:
         ignored = _non_exportable_entries(directory, contents)
-        ignored.update(_EXPORT_CREDENTIAL_FILES & set(contents))
+        ignored.update(entry for entry in contents if _is_export_credential_entry(entry))
         if Path(directory) == profile_dir:
             ignored |= PM_RUNTIME_ROOT_DIRS & set(contents)
+            ignored.update(
+                entry for entry in contents if entry.lower() in _EXPORT_CREDENTIAL_ROOT_DIRS
+            )
         return ignored
 
     ignore = _default_export_ignore(profile_dir) if canon == "default" else _ignore_credentials
