@@ -100,8 +100,8 @@ def _merge_in_order(
     for pos, position in enumerate(fetch_positions):
         url = fetch_urls[pos]
         entries = by_url.get(url)
-        if entries:
-            hit = entries.pop(0) if len(entries) > 1 else entries[0]
+        hit = entries.pop(0) if entries else None
+        if hit is not None:
             merged[position] = hit
         else:
             merged[position] = _result_entry(url, _NO_RESULT_ERROR)

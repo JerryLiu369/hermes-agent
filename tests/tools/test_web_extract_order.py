@@ -105,6 +105,74 @@ def test_merge_in_order_anonymous_results_fallback():
     assert merged[1]["content"] == "Content 1"
 
 
+def test_merge_in_order_duplicate_urls_consume_distinct_results():
+    """Each duplicate requested position consumes one distinct provider row."""
+    url = "https://dup.example.com"
+    fetch_urls = [url, url]
+    results = [
+        {"url": url, "content": "First", "title": "First"},
+        {"url": url, "content": "Second", "title": "Second"},
+    ]
+    merged = wte._merge_in_order(2, {}, [0, 1], fetch_urls, results)
+    assert len(merged) == 2
+    assert merged[0]["content"] == "First"
+    assert merged[0].get("error") in (None, "")
+    assert merged[1]["content"] == "Second"
+    assert merged[1].get("error") in (None, "")
+
+
+def test_merge_in_order_duplicate_urls_fewer_rows_than_positions():
+    """3 duplicate positions with 2 provider rows: the third gets _NO_RESULT_ERROR, not a reuse."""
+    url = "https://dup.example.com"
+    fetch_urls = [url, url, url]
+    results = [
+        {"url": url, "content": "First"},
+        {"url": url, "content": "Second"},
+    ]
+    merged = wte._merge_in_order(3, {}, [0, 1, 2], fetch_urls, results)
+    assert len(merged) == 3
+    assert merged[0]["content"] == "First"
+    assert merged[1]["content"] == "Second"
+    # Intended semantics: one provider row per requested position; shortage is an
+    # explicit miss, never a reuse of the last row.
+    assert merged[2]["url"] == url
+    assert merged[2]["content"] == ""
+    assert merged[2]["error"] == wte._NO_RESULT_ERROR
+    assert merged[2] != merged[1]
+
+
+def test_merge_in_order_duplicate_urls_single_row():
+    """2 duplicate positions with 1 provider row: the second gets _NO_RESULT_ERROR."""
+    url = "https://dup.example.com"
+    fetch_urls = [url, url]
+    results = [
+        {"url": url, "content": "Only"},
+    ]
+    merged = wte._merge_in_order(2, {}, [0, 1], fetch_urls, results)
+    assert len(merged) == 2
+    assert merged[0]["content"] == "Only"
+    assert merged[1]["url"] == url
+    assert merged[1]["content"] == ""
+    assert merged[1]["error"] == wte._NO_RESULT_ERROR
+
+
+def test_merge_in_order_duplicate_urls_interleaved_with_distinct():
+    """Duplicate positions interleaved with another URL still consume per-URL rows independently."""
+    dup = "https://dup.example.com"
+    other = "https://other.example.com"
+    fetch_urls = [dup, other, dup]
+    results = [
+        {"url": dup, "content": "Dup Only"},
+        {"url": other, "content": "Other"},
+    ]
+    merged = wte._merge_in_order(3, {}, [0, 1, 2], fetch_urls, results)
+    assert len(merged) == 3
+    assert merged[0]["content"] == "Dup Only"
+    assert merged[1]["content"] == "Other"
+    assert merged[2]["url"] == dup
+    assert merged[2]["error"] == wte._NO_RESULT_ERROR
+
+
 @pytest.mark.asyncio
 async def test_extract_safe_urls_reordered_without_cache(tmp_path, monkeypatch):
     """Even with zero cache hits, _extract_safe_urls must return results in safe_urls order."""
