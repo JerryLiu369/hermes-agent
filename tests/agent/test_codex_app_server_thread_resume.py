@@ -230,3 +230,59 @@ def test_legacy_binding_without_watermark_still_resumes(monkeypatch, tmp_path):
         assert isinstance(db.get_session_model_config_value(SID, "codex_thread_watermark"), dict)
     finally:
         db.close()
+
+
+def test_single_intervening_user_row_skips_resume_before_new_row(monkeypatch, tmp_path):
+    """kvnloo review control: a lone intervening durable user-only row must not resume.
+
+    The watermark stores only ``{head_id, count}``, so one row past the head is ambiguous
+    unless the allowance is bound to the actual current submit. A failed/aborted/
+    intervening non-Codex turn can durably add exactly one user row; recreating Codex
+    before adding a new row must skip the resume (fail closed), not mistake the stale
+    row for this turn's already-persisted user input.
+    """
+    from agent import codex_runtime as codex_runtime
+
+    monkeypatch.setattr(session_mod, "CodexAppServerClient", _WireClient)
+    monkeypatch.setattr(CodexAppServerSession, "run_turn", _run_turn)
+    _WireClient.instances, _WireClient.dead, _WireClient.counter = [], set(), 0
+    db = SessionDB(Path(tmp_path) / "state.db")
+    try:
+        first = _agent(db)
+        assert first.run_conversation("Remember the word amber.")["completed"]
+        assert db.get_session_model_config_value(SID, "codex_thread_id") == "thread-1"
+        watermark = db.get_session_model_config_value(SID, "codex_thread_watermark")
+        assert isinstance(watermark, dict)
+
+        # One intervening durable user-only row (e.g. a failed turn that persisted only
+        # its input on another provider/route).
+        db.append_messages_batch(SID, [
+            {"role": "user", "content": "stale intervening user-only row"},
+        ])
+
+        # Recreate before adding a new row: the pure lookup carries no proof of the
+        # current submit, so the ambiguous single row must fail closed.
+        probe = _agent(db)
+        assert codex_runtime._stored_codex_thread_id(probe) is None
+        # Same for a pre-persist candidate without a durable row id: no match, no resume.
+        assert codex_runtime._stored_codex_thread_id(
+            probe, [{"role": "user", "content": "Which word now?"}]) is None
+        # The stale lookup leaves the stored binding alone for the fresh turn to rotate.
+        assert db.get_session_model_config_value(SID, "codex_thread_id") == "thread-1"
+        assert db.get_session_model_config_value(SID, "codex_thread_watermark") == watermark
+
+        # Full recreation path: persisting the new turn makes two rows past the
+        # watermark, so the fresh thread is seeded with the updated history.
+        history = db.get_messages_as_conversation(SID)
+        assert any("stale intervening" in str(m.get("content") or "") for m in history)
+        second = _agent(db)
+        assert second.run_conversation("Which word now?", conversation_history=history)["completed"]
+        assert [m for m, _ in _WireClient.instances[1].requests] == ["thread/start"]
+        (_, start_params), = _WireClient.instances[1].requests
+        seed = start_params.get("developerInstructions") or ""
+        assert "Remember the word amber" in seed
+        assert "stale intervening" in seed
+        assert "Which word now?" not in seed
+        assert db.get_session_model_config_value(SID, "codex_thread_id") == "thread-2"
+    finally:
+        db.close()

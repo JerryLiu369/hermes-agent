@@ -502,13 +502,17 @@ def _codex_developer_instructions(agent) -> str:
 #
 # The binding rides with a transcript watermark (``codex_thread_watermark``: the active message
 # head id + count at commit time). A recreated agent resumes only while the durable transcript still
-# ends where the binding left it — the one new row allowed is this turn's already-persisted user
-# input. Any further rows past the watermark (an intervening turn on another provider/route, fresh
-# turns elsewhere) mean the codex thread no longer holds the conversation: the resume is skipped
-# (non-destructively — the stored binding is left alone) so the fresh thread is seeded with the
-# updated history (#127103). Provider/base_url string comparison is deliberately NOT used: the API
-# server never writes the gateway_runtime marker, spellings differ (``custom:<name>`` vs ``custom``,
-# trailing ``/``), and a stale marker would wipe the binding on every request.
+# ends where the binding left it. Zero rows past the watermark (a pre-persist probe) means
+# continuity. One row past the watermark resumes ONLY when the caller proves it is this turn's
+# already-persisted user input (physical row-id match): a failed/aborted/intervening non-Codex
+# turn can durably add exactly one user row, which is otherwise indistinguishable from the
+# current turn. Any further rows past the watermark (an intervening turn on another
+# provider/route, fresh turns elsewhere) mean the codex thread no longer holds the conversation:
+# the resume is skipped (non-destructively — the stored binding is left alone) so the fresh
+# thread is seeded with the updated history (#127103). Provider/base_url string comparison is
+# deliberately NOT used: the API server never writes the gateway_runtime marker, spellings
+# differ (``custom:<name>`` vs ``custom``, trailing ``/``), and a stale marker would wipe the
+# binding on every request.
 _CODEX_THREAD_ID_KEY = "codex_thread_id"
 _CODEX_THREAD_WATERMARK_KEY = "codex_thread_watermark"
 _CODEX_THREAD_RESUME_NOTICE = "Codex thread could not be resumed; starting a new one."
@@ -543,13 +547,36 @@ def _capture_codex_thread_watermark(agent) -> dict | None:
     return {"head_id": ids[-1], "count": len(ids)}
 
 
-def _stored_codex_thread_id(agent) -> str | None:
+def _current_turn_user_row_id(agent, messages: List[Dict[str, Any]] | None) -> int | None:
+    """Physical row id of this turn's already-persisted user input, or ``None``.
+
+    Read off ``agent._persist_user_message_idx`` (the turn prologue's anchor, re-anchored after
+    compaction) so a todo-snapshot/restored user row appended after the current turn can never
+    stand in for it. ``None`` when there is no provable current row (no messages, no anchor,
+    non-user anchor, unflushed row): the single-extra-row allowance then fails closed.
+    """
+    if not isinstance(messages, list):
+        return None
+    idx = getattr(agent, "_persist_user_message_idx", None)
+    if not isinstance(idx, int) or isinstance(idx, bool) or not 0 <= idx < len(messages):
+        return None
+    msg = messages[idx]
+    if not isinstance(msg, dict) or msg.get("role") != "user":
+        return None
+    row_id = msg.get("_row_id")
+    return row_id if isinstance(row_id, int) and not isinstance(row_id, bool) else None
+
+
+def _stored_codex_thread_id(agent, messages: List[Dict[str, Any]] | None = None) -> str | None:
     """Stored thread id, or ``None`` when there is none or the watermark proves it stale.
 
-    Pure lookup: a stale watermark never clears the row (the fresh thread overwrites the
-    binding once its own turn commits). A missing/malformed watermark (pre-#127103 rows,
-    stub DBs) resumes as before; a DB read failure fails open to resume so a transient
-    store wobble cannot strand the conversation on a blind thread.
+    ``messages`` is this turn's live transcript (current user row last); its persisted
+    ``_row_id`` binds the one-row allowance to the actual current submit. Pure lookup
+    (``messages=None``) carries no proof, so a single row past the watermark fails closed.
+    A stale watermark never clears the row (the fresh thread overwrites the binding once
+    its own turn commits). A missing/malformed watermark (pre-#127103 rows, stub DBs)
+    resumes as before; a DB read failure fails open to resume so a transient store wobble
+    cannot strand the conversation on a blind thread.
     """
     db, session_id = getattr(agent, "_session_db", None), getattr(agent, "session_id", None)
     if db is None or not session_id:
@@ -593,12 +620,24 @@ def _stored_codex_thread_id(agent) -> str | None:
         logger.info("codex thread %s not resumed: transcript before the watermark changed (session=%s)",
                     thread_id[:8], session_id)
         return None
-    # Rows past the watermark: none (pre-persist probe) or exactly this turn's user input means
-    # continuity; anything more is an intervening turn elsewhere — seed a fresh thread instead.
-    if len(ids) - (ids.index(head_id) + 1) <= 1:
+    # Rows past the watermark: none (pre-persist probe) means continuity; one row resumes
+    # only when it is provably this turn's already-persisted user input (row-id match) —
+    # an intervening durable user-only row (failed/aborted/non-Codex turn) is otherwise
+    # indistinguishable from the current turn. Anything more is an intervening turn
+    # elsewhere — seed a fresh thread instead.
+    head_idx = ids.index(head_id)
+    extra = len(ids) - (head_idx + 1)
+    if extra == 0:
         return thread_id
-    logger.info("codex thread %s not resumed: %d message(s) past the stored watermark (session=%s)",
-                thread_id[:8], len(ids) - (ids.index(head_id) + 1), session_id)
+    if extra > 1:
+        logger.info("codex thread %s not resumed: %d message(s) past the stored watermark (session=%s)",
+                    thread_id[:8], extra, session_id)
+        return None
+    current_row_id = _current_turn_user_row_id(agent, messages)
+    if current_row_id is not None and ids[head_idx + 1] == current_row_id:
+        return thread_id
+    logger.info("codex thread %s not resumed: 1 message(s) past the stored watermark "
+                "that is not this turn's user input (session=%s)", thread_id[:8], session_id)
     return None
 
 
@@ -650,7 +689,7 @@ def _ensure_codex_session(agent, messages: List[Dict[str, Any]] | None = None) -
         if recorded is None or recorded == developer_instructions:
             return
         _close_codex_session(agent)
-    resume_thread_id = None if getattr(agent, "_codex_session_prompt", None) is not None else _stored_codex_thread_id(agent)
+    resume_thread_id = None if getattr(agent, "_codex_session_prompt", None) is not None else _stored_codex_thread_id(agent, messages)
     from agent.runtime_cwd import resolve_agent_cwd
     from agent.transports.codex_app_server_session import CodexAppServerSession, _ServerRequestRouting
     from hermes_cli.codex_runtime_switch import get_configured_codex_binary
