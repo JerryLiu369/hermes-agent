@@ -151,3 +151,24 @@ def test_undo_after_an_unanswered_turn_rewinds_the_merged_turn_on_every_surface(
     assert [c for _i, _r, c, a in _active_rows(db, sid) if a] == ["q1", "a1"]
     assert _rewind_via(surface, db, sid, 1) is not None
     assert [c for _i, _r, c, a in _active_rows(db, sid) if a] == []
+
+
+def test_stale_warm_prefix_with_same_turn_count_refuses_rewind(db):
+    """#126765: a warm history with an equal user-turn count but a different earlier user turn must not
+    pass validation, be installed, or be persisted."""
+    import copy
+
+    from hermes_state_rewind import _HISTORY_CHANGED
+
+    sid = "stale-prefix"
+    _seed(db, sid, turns=3)
+    warm = copy.deepcopy(db.get_resume_conversations(sid)[0])
+    warm_user = [i for i, m in enumerate(warm) if m.get("role") == "user"]
+    assert len(warm_user) == 3
+    # Same count, same target text — only an EARLIER user turn differs.
+    warm[warm_user[0]] = {**warm[warm_user[0]], "content": "stale-q1"}
+    before = _active_rows(db, sid)
+    with pytest.raises(RuntimeError) as excinfo:
+        db.rewind_user_turn(sid, 2, warm_history=warm)
+    assert str(excinfo.value) == _HISTORY_CHANGED
+    assert _active_rows(db, sid) == before
