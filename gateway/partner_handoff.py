@@ -16,10 +16,12 @@ from typing import Optional, Union
 def format_handoff_created(ts: float | str | datetime | None = None) -> str | None:
     """Creation timestamp for a handoff header, as ``YYYY-MM-DDTHH:MM:SS.mmmZ``.
 
-    Accepts epoch seconds (``int``/``float`` or a numeric string) or an
-    already-formatted timestamp string, which is passed through stripped.
-    Returns ``None`` for ``None``/empty/uninterpretable input so callers can
-    omit the ``created`` segment.
+    Accepts epoch seconds (``int``/``float`` or a numeric string), a ``datetime``,
+    or an ISO-8601 string, all normalized to constant-width milliseconds so
+    lexicographic order matches creation order. A non-empty string in no
+    recognized shape is passed through stripped (documented legacy behavior);
+    ``None``/empty/uninterpretable input returns ``None`` so callers can omit
+    the ``created`` segment.
     """
     if ts is None:
         return None
@@ -40,6 +42,11 @@ def format_handoff_created(ts: float | str | datetime | None = None) -> str | No
         try:
             return _format_epoch(float(text))
         except (TypeError, ValueError, OverflowError, OSError):
+            pass
+        try:
+            iso = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+            return _format_datetime(datetime.fromisoformat(iso))
+        except (TypeError, ValueError):
             return text
     return None
 

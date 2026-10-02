@@ -74,3 +74,17 @@ def test_datetime_ts_supported():
     dt = datetime(2026, 10, 1, 13, 45, 12, tzinfo=timezone.utc)
     assert format_handoff_created(dt) == "2026-10-01T13:45:12.000Z"
     assert "created 2026-10-01T13:45:12.000Z" in human_notice("5b00c28600", "wren", "p", "i", dt)
+
+
+def test_iso_string_without_millis_normalizes_to_constant_width():
+    # Follow-up on #130673: a legacy no-millisecond ISO string must not pass
+    # through as 20 chars, or lexicographic order breaks again.
+    assert format_handoff_created("2026-10-01T13:45:12Z") == "2026-10-01T13:45:12.000Z"
+    assert format_handoff_created("2026-10-01T13:45:12.001Z") == "2026-10-01T13:45:12.001Z"
+    assert format_handoff_created("2026-10-01T13:45:12+00:00") == "2026-10-01T13:45:12.000Z"
+    older = format_handoff_created("2026-10-01T13:45:12Z")
+    newer = format_handoff_created("2026-10-01T13:45:12.001Z")
+    assert older is not None and newer is not None
+    assert older < newer
+    # Truly unrecognized strings keep the documented passthrough.
+    assert format_handoff_created("not-a-timestamp") == "not-a-timestamp"
