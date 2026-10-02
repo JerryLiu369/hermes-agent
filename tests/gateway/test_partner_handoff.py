@@ -12,7 +12,7 @@ def _epoch(year, month, day, hour, minute, second, ms=0):
 def test_human_notice_header_matches_proposed_format():
     ts = _epoch(2026, 10, 1, 13, 45, 12)
     text = human_notice("5b00c286deadbeef", "wren", "peer", "key is at ~/peer-keys/money.key", ts)
-    assert "[Handoff 5b00c286 · created 2026-10-01T13:45:12Z · from your conversation with wren]" in text
+    assert "[Handoff 5b00c286 · created 2026-10-01T13:45:12.000Z · from your conversation with wren]" in text
     assert "key is at ~/peer-keys/money.key" in text
 
 
@@ -36,16 +36,16 @@ def test_missing_ts_omits_created_segment_backward_compatible():
 
 def test_ts_accepts_float_int_numeric_string_and_iso_string():
     epoch = _epoch(2026, 10, 1, 13, 45, 12)
-    iso = "2026-10-01T13:45:12Z"
+    iso = "2026-10-01T13:45:12.000Z"
     for ts in (epoch, int(epoch), str(epoch), iso):
         assert format_handoff_created(ts) == iso
         assert f"created {iso}" in human_notice("5b00c28600", "wren", "p", "i", ts)
         assert f"created {iso}" in agent_notice("5b00c28600", "wren", "p", "i", ts)
 
 
-def test_subsecond_precision_preserved_but_zero_millis_trimmed():
+def test_subsecond_precision_preserved_and_zero_millis_not_trimmed():
     assert format_handoff_created(_epoch(2026, 10, 1, 13, 43, 6, ms=401)) == "2026-10-01T13:43:06.401Z"
-    assert format_handoff_created(_epoch(2026, 10, 1, 13, 45, 12)) == "2026-10-01T13:45:12Z"
+    assert format_handoff_created(_epoch(2026, 10, 1, 13, 45, 12)) == "2026-10-01T13:45:12.000Z"
     assert format_handoff_created("") is None
     assert format_handoff_created(None) is None
 
@@ -53,10 +53,12 @@ def test_subsecond_precision_preserved_but_zero_millis_trimmed():
 def test_receiver_can_recover_creation_order_despite_delivery_order():
     # Issue shape: 5b00c286 created second, delivered fourth — after the hold.
     # The created stamps must order opposite to delivery order.
+    # Edge case: same second with .000Z vs .001Z to ensure constant-width
+    # string sorting matches chronological order.
     older = human_notice("5b00c28600", "wren", "p", "scp it", _epoch(2026, 10, 1, 13, 45, 12))
-    newer = human_notice("287323db00", "wren", "p", "HOLD", _epoch(2026, 10, 1, 13, 49, 51, ms=399))
-    assert "created 2026-10-01T13:45:12Z" in older
-    assert "created 2026-10-01T13:49:51.399Z" in newer
+    newer = human_notice("287323db00", "wren", "p", "HOLD", _epoch(2026, 10, 1, 13, 45, 12, ms=1))
+    assert "created 2026-10-01T13:45:12.000Z" in older
+    assert "created 2026-10-01T13:45:12.001Z" in newer
     assert older.split("created ")[1] < newer.split("created ")[1]
 
 
@@ -70,5 +72,5 @@ def test_id_truncated_to_eight_and_empty_requester_falls_back():
 
 def test_datetime_ts_supported():
     dt = datetime(2026, 10, 1, 13, 45, 12, tzinfo=timezone.utc)
-    assert format_handoff_created(dt) == "2026-10-01T13:45:12Z"
-    assert "created 2026-10-01T13:45:12Z" in human_notice("5b00c28600", "wren", "p", "i", dt)
+    assert format_handoff_created(dt) == "2026-10-01T13:45:12.000Z"
+    assert "created 2026-10-01T13:45:12.000Z" in human_notice("5b00c28600", "wren", "p", "i", dt)

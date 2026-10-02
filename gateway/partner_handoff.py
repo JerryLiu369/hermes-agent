@@ -13,8 +13,8 @@ from datetime import datetime, timezone
 from typing import Optional, Union
 
 
-def format_handoff_created(ts: float | str | None = None) -> str | None:
-    """Creation timestamp for a handoff header, as ``YYYY-MM-DDTHH:MM:SS[.mmm]Z``.
+def format_handoff_created(ts: float | str | datetime | None = None) -> str | None:
+    """Creation timestamp for a handoff header, as ``YYYY-MM-DDTHH:MM:SS.mmmZ``.
 
     Accepts epoch seconds (``int``/``float`` or a numeric string) or an
     already-formatted timestamp string, which is passed through stripped.
@@ -57,10 +57,7 @@ def _format_datetime(dt: datetime) -> str:
         dt = dt.replace(tzinfo=timezone.utc)
     else:
         dt = dt.astimezone(timezone.utc)
-    iso = dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
-    if iso.endswith(".000Z"):
-        iso = iso[:-5] + "Z"
-    return iso
+    return dt.isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _short_id(handoff_id: str) -> str:
@@ -75,7 +72,7 @@ def _who(requester: str, partner: str) -> str:
     return "someone"
 
 
-def _header(handoff_id: str, requester: str, partner: str, ts: float | str | None = None) -> str:
+def _header(handoff_id: str, requester: str, partner: str, ts: float | str | datetime | None = None) -> str:
     short = _short_id(handoff_id)
     who = _who(requester, partner)
     created = format_handoff_created(ts)
@@ -89,7 +86,7 @@ def human_notice(
     requester: str,
     partner: str,
     intent: str,
-    ts: float | str | None = None,
+    ts: float | str | datetime | None = None,
 ) -> str:
     """User-visible handoff text: header (id + creation time) plus intent."""
     header = _header(handoff_id, requester, partner, ts)
@@ -101,7 +98,7 @@ def agent_notice(
     requester: str,
     partner: str,
     intent: str,
-    ts: float | str | None = None,
+    ts: float | str | datetime | None = None,
 ) -> str:
     """Agent-facing handoff text: same ordering signal (id + creation time)."""
     header = _header(handoff_id, requester, partner, ts)
