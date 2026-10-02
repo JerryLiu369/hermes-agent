@@ -1007,14 +1007,18 @@ def _duplicates_configured_row(
     at another endpoint or another key stays a candidate) or a legacy duplicate with the same
     provider identity."""
     identity = _configured_provider_identity(slug, entry)
-    provider_key = _clean(entry.get("provider_key")).lower()
+    raw_key = _clean(entry.get("provider_key"))
+    provider_key = raw_key.lower()
     if provider_key:
         # #130100 fast path: the compat view stamps every ``providers.<slug>`` projection with
         # ``provider_key=<slug>``. A case-insensitive hit on a user row with the same endpoint +
         # credential is one declaration counted twice (``slug`` vs ``custom:<name>``) — fold it
         # before the multiple-guard. Any difference in endpoint or credential keeps it distinct.
-        lowered = {row_slug.lower(): (row_slug, row) for row_slug, row in rows.items()}
-        hit = lowered.get(provider_key)
+        # Resolve the exact slug first, then fall back to case-insensitive: a plain
+        # ``{slug.lower(): ...}`` dict collapses case-variant siblings (``a`` vs ``A``),
+        # last-wins, so key ``a`` would resolve to row ``A``.
+        hit = next(((s, r) for s, r in rows.items() if s == raw_key), None) or \
+            next(((s, r) for s, r in rows.items() if s.lower() == provider_key), None)
         if hit is not None and identity[1:3] == hit[1][1:3]:
             return hit[0]
     return next((row_slug for row_slug, row in rows.items()

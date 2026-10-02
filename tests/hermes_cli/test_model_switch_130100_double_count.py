@@ -19,7 +19,11 @@ Hermetic: the model-resolution chain is fully mocked (no network), mirroring
 
 from unittest.mock import patch
 
-from hermes_cli.model_switch import _configured_provider_matches, switch_model
+from hermes_cli.model_switch import (
+    _configured_provider_matches,
+    _duplicates_configured_row,
+    switch_model,
+)
 
 _ACCEPTED = {"accepted": True, "persist": True, "recognized": True, "message": None}
 
@@ -169,3 +173,32 @@ def test_provider_key_aimed_elsewhere_stays_distinct():
     )
     assert result.success is False
     assert "multiple configured providers" in (result.error_message or "")
+
+
+def test_case_variant_sibling_rows_resolve_exact_first():
+    """Case-variant sibling rows (``a`` vs ``A``) sharing an endpoint must not collapse
+    last-wins: ``provider_key='a'`` resolves to row ``a``, not ``A``."""
+    from hermes_cli.model_switch import _configured_provider_identity
+
+    cfg_a = {"base_url": "https://x.example/v1", "api_key": "k"}
+    cfg_upper = {"base_url": "https://x.example/v1", "api_key": "k"}
+    rows = {
+        "a": _configured_provider_identity("a", cfg_a),
+        "A": _configured_provider_identity("A", cfg_upper),
+    }
+    # Sanity: siblings share endpoint/credential so the fast-path guard passes for both.
+    assert rows["a"][1:3] == rows["A"][1:3]
+
+    entry_a = {
+        "name": "a", "base_url": "https://x.example/v1", "api_key": "k",
+        "provider_key": "a",
+    }
+    entry_upper = {
+        "name": "A", "base_url": "https://x.example/v1", "api_key": "k",
+        "provider_key": "A",
+    }
+    assert _duplicates_configured_row("custom:a", entry_a, rows) == "a"
+    assert _duplicates_configured_row("custom:A", entry_upper, rows) == "A"
+
+    # Fallback still folds when no exact row exists (different-case key, same endpoint).
+    assert _duplicates_configured_row("custom:A", entry_upper, {"a": rows["a"]}) == "a"
