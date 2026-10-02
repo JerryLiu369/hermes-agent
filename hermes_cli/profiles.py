@@ -2149,7 +2149,7 @@ def _default_export_ignore(root_dir: Path):
 _EXPORT_CREDENTIAL_FILES = frozenset({
     # Core Hermes credential stores
     "auth.json", "auth.lock", "credentials",
-    ".env", ".op.env",
+    ".env", ".op.env", ".envrc",
     ".anthropic_oauth.json",
     # Package-registry auth Hermes reads from the profile home
     # (``hermes_cli/source_build.py`` points ``NPM_CONFIG_USERCONFIG`` at ``<home>/npmrc``)
@@ -2174,7 +2174,8 @@ _EXPORT_CREDENTIAL_FILES = frozenset({
 
 # Credential directories dropped from exports (matched by dirname at any depth,
 # case-insensitively; the whole subtree is pruned). Distinctive names that cannot
-# collide with user skill/data directories.
+# collide with user skill/data directories — including the OS credential stores
+# ``agent/file_safety.py`` hard-denies under a profile home (.ssh/.aws/.gnupg/.kube).
 _EXPORT_CREDENTIAL_DIRS = frozenset({
     "bot-desktop",
     "mcp-tokens",
@@ -2183,6 +2184,7 @@ _EXPORT_CREDENTIAL_DIRS = frozenset({
     "browser-profile",
     "browser_auth",
     "credentials",
+    ".ssh", ".aws", ".gnupg", ".kube",
 })
 
 # Credential-adjacent directories dropped only at the profile root. Generic names

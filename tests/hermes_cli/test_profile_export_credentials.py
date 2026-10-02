@@ -80,6 +80,8 @@ _CREDENTIAL_ROOT_FILES = [
     "bws_cache.json", "bws_cache.enc.json",
     "channel_directory.json", "channel_aliases.json",
     ".env.local",
+    # direnv project env (blocked anywhere on disk by file_safety, leaks tokens)
+    ".envrc",
 ]
 
 # Credential subtrees seeded under the profile root: (top, relative leaf).
@@ -105,6 +107,13 @@ _CREDENTIAL_TREES = [
     ("google_chat_user_tokens", "u@x.json"),
     ("google_chat_user_oauth_pending", "u@x.json"),
     ("gateway", "discord_message_recovery.db"),
+    # OS credential stores hard-denied by file_safety under a profile home (#130398)
+    (".ssh", "id_ed25519"),
+    (".ssh", "authorized_keys"),
+    (".ssh", "config"),
+    (".gnupg", "secring.gpg"),
+    (".aws", "credentials"),
+    (".kube", "config"),
 ]
 
 _FULL_DIR_TOPS = frozenset(
