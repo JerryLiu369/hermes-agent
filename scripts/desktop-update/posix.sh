@@ -854,6 +854,7 @@ stream_update() { # "$@" = update argv; streams combined output live to $LOG, se
   }
   "$@" 2>&1 | tee -a "$LOG" > "$capture" 2>/dev/null
   CODE=${PIPESTATUS[0]:-3}
+  [ -s "$capture" ] && [ "$(tail -c1 "$capture" | wc -l)" -eq 0 ] && printf '\n' >> "$LOG"
   OUT="$(cat "$capture" 2>/dev/null)"
   rm -f "$capture" 2>/dev/null || true
   return 0

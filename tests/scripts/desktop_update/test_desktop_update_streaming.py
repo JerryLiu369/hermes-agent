@@ -48,6 +48,12 @@ echo "CODE UPDATE SKIPPED: parked on a feature branch"
 exit 1
 """
 
+FAKE_UNTERMINATED_HERMES = """#!/usr/bin/env bash
+case "$*" in *--help*) echo "--keep-stash"; exit 0 ;; esac
+printf '%s' "PROGRESS 42% (no newline)"
+exit 0
+"""
+
 
 def _install_fake_hermes(tmp_path: Path, body: str) -> Path:
     install_root = tmp_path / "hermes-agent"
@@ -122,3 +128,23 @@ def test_retained_output_still_drives_skip_detection(tmp_path):
 
     handoff_log = tmp_path / "logs" / "desktop-update-handoff.log"
     assert "CODE UPDATE SKIPPED" in handoff_log.read_text(encoding="utf-8", errors="replace")
+
+
+@requires_posix_handoff
+def test_unterminated_child_output_preserves_log_line_discipline(tmp_path):
+    """Child output lacking a trailing newline must not swallow the next log timestamp."""
+    install_root = _install_fake_hermes(tmp_path, FAKE_UNTERMINATED_HERMES)
+    _launch_handoff(tmp_path, install_root, {})
+
+    result_path = tmp_path / ".hermes-update-result.json"
+    _wait_for(result_path, '"ok":true', timeout_s=45)
+
+    handoff_log = tmp_path / "logs" / "desktop-update-handoff.log"
+    content = handoff_log.read_text(encoding="utf-8", errors="replace")
+    lines = content.splitlines()
+    assert "PROGRESS 42% (no newline)" in lines
+    exit_lines = [line for line in lines if "hermes update exit code: 0" in line]
+    assert len(exit_lines) == 1
+    # Exit line starts with ISO-8601 timestamp, not appended to the partial output
+    assert not any("PROGRESS 42% (no newline)" in line and "hermes update exit code" in line for line in lines)
+
