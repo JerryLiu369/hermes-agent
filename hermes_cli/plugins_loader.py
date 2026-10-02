@@ -105,7 +105,10 @@ def _resolve_plugin_load_timeout() -> float:
 
 
 def _startup_lease_holds_contention() -> bool:
-    """True when the startup watchdog holds a live progress lease (best-effort, never raises)."""
+    """True while the startup progress window holds a live lease (best-effort, never raises).
+
+    The window survives watchdog disarm (see ``startup_watchdog_lease_active``):
+    deferred loads materializing after the loop goes live still run inside it."""
     try:
         from hermes_startup_watchdog import startup_watchdog_lease_active
         active, _, _ = startup_watchdog_lease_active()

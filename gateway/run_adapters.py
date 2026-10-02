@@ -1269,6 +1269,47 @@ class GatewayAdapterLifecycleMixin:
             )
         return lines
 
+    def _note_secondary_missing_platform(self, profile_name: str, platform) -> None:
+        """Record a secondary platform whose adapter never materialized (#126356).
+
+        Bare test runners build the runner via ``object.__new__`` without
+        ``__init__``, so the store is fetched tolerantly and created on demand.
+        """
+        try:
+            pending = getattr(self, "_profile_plugin_retry_pending", None)
+            if not isinstance(pending, dict):
+                pending = self._profile_plugin_retry_pending = {}
+            entries = pending.get(profile_name)
+            if not isinstance(entries, set):
+                entries = pending[profile_name] = set()
+            entries.add(getattr(platform, "value", platform))
+        except Exception:
+            pass
+
+    def _clear_secondary_missing_platform(self, profile_name: str, platform) -> None:
+        """Drop a healed pending entry; removes the profile key when drained."""
+        try:
+            pending = getattr(self, "_profile_plugin_retry_pending", None)
+            if not isinstance(pending, dict):
+                return
+            entries = pending.get(profile_name)
+            if isinstance(entries, set):
+                entries.discard(getattr(platform, "value", platform))
+                if not entries:
+                    pending.pop(profile_name, None)
+        except Exception:
+            pass
+
+    def _secondary_retry_pending_profiles(self) -> set:
+        """Served profiles owed a rescan retry for a never-materialized platform."""
+        try:
+            pending = getattr(self, "_profile_plugin_retry_pending", None)
+            if not isinstance(pending, dict):
+                return set()
+            return {name for name, entries in pending.items() if entries}
+        except Exception:
+            return set()
+
     async def _start_one_profile_adapters(
         self, profile_name: str, profile_home: "Path", claimed: Dict[tuple, str]
     ) -> int:
@@ -1318,6 +1359,15 @@ class GatewayAdapterLifecycleMixin:
                 platform.value, exc_info=True,
             ):
                 with _profile_runtime_scope(profile_home, hydrate_secrets=False):
+                    # A previous sweep's failed deferred load parks its loader as
+                    # consumed: revive it before recreating so a rescan retry
+                    # actually re-runs the load instead of returning None again
+                    # (#126356 review). No-op when nothing is parked.
+                    try:
+                        from gateway.platform_registry import platform_registry
+                        platform_registry.retry_failed_load(platform.value)
+                    except Exception:
+                        pass
                     adapter = self._create_adapter(platform, platform_config)
                 if not adapter:
                     logger.warning(
@@ -1336,6 +1386,7 @@ class GatewayAdapterLifecycleMixin:
                             "(plugin failed to load; will retry on rescan)"
                         ),
                     )
+                    self._note_secondary_missing_platform(profile_name, platform)
             if not adapter:
                 continue
             # Same-token / same-listener conflict detection — refuse a duplicate poll or bind.
@@ -1366,6 +1417,8 @@ class GatewayAdapterLifecycleMixin:
                 self._schedule_secondary_profile_startup_reconnect(profile_name, platform, adapter)
                 continue
             profile_map[platform] = adapter
+            # A rescan retry healed what a previous sweep recorded as missing.
+            self._clear_secondary_missing_platform(profile_name, platform)
             # Restore persisted /voice state for this bot (primary startup and reconnects do too).
             # See #84872.
             self._sync_voice_mode_state_to_adapter(adapter)

@@ -11,7 +11,9 @@ startup progress lease is held.
 
 import asyncio
 import time
-from unittest.mock import MagicMock
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -147,3 +149,248 @@ def test_plugin_deadline_extended_while_progress_lease_held(tmp_path, monkeypatc
         assert plugins_loader._resolve_plugin_load_timeout() == 0
     finally:
         sw._reset_for_tests()
+
+
+def test_plugin_deadline_survives_disarm_inside_lease_window(tmp_path, monkeypatch):
+    """The floor must survive ``record_startup() -> disarm`` ordering (#126356 review).
+
+    Boot claims the progress lease (state.db integrity check / schema work during
+    ``GatewayRunner.__init__``) and disarms the watchdog once the loop is live —
+    but deferred plugin loads materialize afterwards, still inside the claimed
+    window. The floor must apply to them, not just to loads while armed.
+    """
+    import time as _time
+
+    import hermes_startup_watchdog as sw
+    from hermes_cli import plugins_loader
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    sw._reset_for_tests()
+    try:
+        handle = sw.arm_startup_watchdog(timeout_s=300)
+        assert handle is not None
+        # Models what record_startup()'s integrity check does on boot.
+        sw.report_startup_progress(900, phase="state_db_unclean_integrity_check")
+        assert plugins_loader._resolve_plugin_load_timeout() >= 60.0
+
+        sw.disarm_startup_watchdog()
+        active, phase, _remaining = sw.startup_watchdog_lease_active()
+        assert active is True
+        assert phase == "state_db_unclean_integrity_check"
+        # The choke point every load passes through still grants the floor.
+        assert plugins_loader._resolve_plugin_load_timeout() >= 60.0
+
+        # Once the window lapses the deadline falls back to the default.
+        base = _time.monotonic()
+        monkeypatch.setattr(_time, "monotonic", lambda: base + 901.0)
+        active, _, _ = sw.startup_watchdog_lease_active()
+        assert active is False
+        assert plugins_loader._resolve_plugin_load_timeout() == pytest.approx(10.0)
+    finally:
+        sw._reset_for_tests()
+
+
+def test_gateway_boot_claims_lease_before_plugin_discovery(tmp_path, monkeypatch):
+    """``GatewayRunner.__init__`` must hold the lease before the first sweep (#126356 review).
+
+    The first ``discover_plugins()`` runs inside config load; the state.db leases
+    only start after it. Without an early claim none of the eager loads ever see
+    a live lease (reviewer: 53 loads, 0 saw one).
+    """
+    import hermes_startup_watchdog as sw
+    from gateway import run as run_mod
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    sw._reset_for_tests()
+    try:
+        assert sw.arm_startup_watchdog(timeout_s=300) is not None
+        order: list = []
+        lease_seen_at_discover: list = []
+
+        from hermes_cli import plugins as plugins_mod
+
+        real_discover_and_load = plugins_mod.PluginManager.discover_and_load
+
+        def _spy_discover(self, force: bool = False):
+            active, _, _ = sw.startup_watchdog_lease_active()
+            lease_seen_at_discover.append(bool(active))
+            order.append("discover")
+            return real_discover_and_load(self, force=force)
+
+        real_report = sw.report_startup_progress
+
+        def _spy_report(expected_s, phase: str = ""):
+            order.append("lease")
+            return real_report(expected_s, phase=phase)
+
+        monkeypatch.setattr(
+            plugins_mod.PluginManager, "discover_and_load", _spy_discover
+        )
+        monkeypatch.setattr(sw, "report_startup_progress", _spy_report)
+
+        runner = run_mod.GatewayRunner.__new__(run_mod.GatewayRunner)
+        # Run only the head of __init__ (early claim + config load) with the
+        # remaining inits stubbed: full construction needs a live home/DB.
+        for name in (
+            "_init_runtime_settings", "_init_session_store", "_init_lifecycle_state",
+            "_init_runtime_caches", "_init_startup_checks", "_init_session_db",
+            "_init_registries_and_clocks",
+        ):
+            monkeypatch.setattr(runner, name, lambda: None)
+        monkeypatch.setattr(runner, "_warn_if_docker_media_delivery_is_risky", lambda: None)
+        run_mod.GatewayRunner.__init__(runner)
+        assert "discover" in order, "expected a discovery sweep during config load"
+        assert order.index("lease") < order.index("discover")
+        assert lease_seen_at_discover and all(lease_seen_at_discover)
+    finally:
+        sw._reset_for_tests()
+
+
+def _secondary_runner(tmp_path, monkeypatch):
+    """Bare multiplex runner shaped like ``test_multiplex_hot_serve._runner``."""
+    from gateway.run_profile_reconcile import profile_serve_signature
+
+    home = tmp_path / ".hermes"
+    (home / "profiles").mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(multiplex_profiles=True)
+    runner._running = True
+    runner._primary_profile_name = "default"
+    runner.adapters = {}
+    runner._profile_adapters = {}
+    runner._profile_failed_platforms = {}
+    runner._profile_plugin_retry_pending = {}
+    runner._profile_configs = {}
+    runner._failed_platforms = {}
+    runner._served_profile_homes = None
+    runner._served_profile_signatures = None
+    runner._profile_reconcile_lock = None
+    runner._agent_cache = {}
+    runner.pairing_store = MagicMock()
+    runner.pairing_stores = {}
+    runner._adapter_disconnect_timeout_secs = lambda: 0.5
+    return runner, home
+
+
+def _mk_secondary(home, name, env=""):
+    d = home / "profiles" / name
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "config.yaml").write_text("model: {default: m}\n", encoding="utf-8")
+    (d / ".env").write_text(env, encoding="utf-8")
+    return d
+
+
+@pytest.mark.asyncio
+async def test_secondary_missing_platform_retried_on_rescan_without_config_change(
+    tmp_path, monkeypatch
+):
+    """A failed secondary platform load must retry on a later tick (#126356 review).
+
+    The failure touches neither config.yaml nor .env, so the signature check
+    alone leaves the profile in neither added nor changed and
+    ``_apply_profile_changes`` early-returns without re-entering
+    ``_start_one_profile_adapters`` — a permanently-``retrying`` platform.
+    """
+    from gateway.run_profile_reconcile import profile_serve_signature
+
+    runner, home = _secondary_runner(tmp_path, monkeypatch)
+    beta = _mk_secondary(home, "beta", "DISCORD_BOT_TOKEN=beta-token\n")
+    monkeypatch.setattr(
+        "gateway.status.live_gateway_pid_for_home", lambda h: None
+    )
+    runner._served_profile_homes = {"beta": beta}
+    runner._served_profile_signatures = {"beta": profile_serve_signature(beta)}
+    # Post-boot state: the boot sweep failed to materialize the platform and
+    # recorded the pending entry (real code does this inside
+    # ``_start_one_profile_adapters``).
+    runner._profile_plugin_retry_pending = {"beta": {"discord"}}
+    calls: list = []
+
+    async def _start(profile_name, profile_home, claimed):
+        calls.append(profile_name)
+        runner._clear_secondary_missing_platform(profile_name, Platform.DISCORD)
+        return 1
+
+    runner._start_one_profile_adapters = _start  # type: ignore[method-assign]
+
+    with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+        first = await runner.reconcile_served_profiles(reason="watcher")
+    assert first["rescanned"] == ["beta"], first
+    assert calls == ["beta"]
+
+    # Healed: no config change, no pending entry — the next tick stays quiet.
+    with patch("hermes_cli.profiles.get_active_profile_name", return_value="default"):
+        second = await runner.reconcile_served_profiles(reason="watcher")
+    assert second["rescanned"] == []
+    assert second["added"] == [] and second["removed"] == []
+    assert calls == ["beta"]
+
+
+@pytest.mark.asyncio
+async def test_start_one_profile_adapters_notes_and_clears_missing(tmp_path, monkeypatch):
+    """The real ``_start_one_profile_adapters`` records a missing platform for rescan
+    and clears it once the retry heals (reviving a parked deferred loader first)."""
+    runner, home = _secondary_runner(tmp_path, monkeypatch)
+    beta = _mk_secondary(home, "beta", "DISCORD_BOT_TOKEN=beta-token\n")
+
+    profile_cfg = SimpleNamespace(
+        platforms={Platform.DISCORD: PlatformConfig(enabled=True, token="beta-token")}
+    )
+
+    async def _fake_load_config(profile_name, profile_home):
+        return profile_cfg
+
+    runner._load_secondary_profile_config = _fake_load_config  # type: ignore[method-assign]
+    monkeypatch.setattr("gateway.run._platform_has_bot_credential", lambda *a: True)
+
+    created = {"calls": 0}
+
+    class _FakeAdapter:
+        platform = Platform.DISCORD
+
+    def _create(platform, cfg):
+        created["calls"] += 1
+        return None if created["calls"] == 1 else _FakeAdapter()
+
+    runner._create_adapter = _create  # type: ignore[method-assign]
+    runner._configure_profile_adapter = lambda *a, **k: None
+    runner._connect_initial_adapter_with_timeout = (  # type: ignore[method-assign]
+        lambda adapter, platform: asyncio.sleep(0, result=True)
+    )
+    runner._sync_voice_mode_state_to_adapter = lambda *a, **k: None
+    runner._safe_adapter_disconnect = (  # type: ignore[method-assign]
+        lambda adapter, platform: asyncio.sleep(0, result=None)
+    )
+    runner._schedule_secondary_profile_startup_reconnect = lambda *a, **k: None
+    runner._adapter_credential_claim = staticmethod(lambda platform, adapter: None)
+    runner._adapter_listener_claim = staticmethod(lambda platform, adapter: None)
+    runner._refuse_duplicate_claim = lambda *a, **k: False
+    statuses: list = []
+    runner._update_platform_runtime_status = (  # type: ignore[method-assign]
+        lambda name, **fields: statuses.append((name, fields))
+    )
+
+    revived: list = []
+    from gateway import platform_registry as registry_mod
+
+    real_retry = registry_mod.platform_registry.retry_failed_load
+
+    def _spy_retry(name, *, scope=None):
+        revived.append(name)
+        return real_retry(name, scope=scope)
+
+    monkeypatch.setattr(registry_mod.platform_registry, "retry_failed_load", _spy_retry)
+
+    assert await runner._start_one_profile_adapters("beta", beta, {}) == 0
+    assert runner._secondary_retry_pending_profiles() == {"beta"}
+    assert any(
+        name == "beta:discord" and fields.get("platform_state") == "retrying"
+        for name, fields in statuses
+    )
+
+    assert await runner._start_one_profile_adapters("beta", beta, {}) == 1
+    assert runner._secondary_retry_pending_profiles() == set()
+    assert Platform.DISCORD in runner._profile_adapters["beta"]
+    assert "discord" in revived
