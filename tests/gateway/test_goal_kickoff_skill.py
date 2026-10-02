@@ -14,9 +14,10 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent, MessageType
+from gateway.run import GatewayRunner
 from gateway.run_busy import GatewayBusySessionMixin
 from gateway.run_turn import GatewayTurnMixin
-from gateway.session import SessionEntry, SessionSource
+from gateway.session import SessionEntry, SessionSource, SessionStore
 from gateway.slash_commands_goals import GatewayGoalCommandsMixin
 
 
@@ -281,3 +282,96 @@ async def test_goal_continuation_does_not_reload_skill():
     )
 
     auto_load_mock.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hmwa_open_session_not_new_when_emptied_by_rewind():
+    """/undo or /retry rewinding the oldest turn leaves an empty transcript, but the
+    session already ran turns (token counters survive truncation): it must NOT take
+    the new-session branch again — no second session:start, no skill re-prepend (#130381)."""
+    runner = _GoalTestRunner()
+    now = datetime(2026, 10, 1, 12, 0, 0)
+    later = now + timedelta(minutes=30)
+
+    entry = SessionEntry(
+        session_key="slack:C1:U1",
+        session_id="sess_rewound",
+        created_at=now,
+        updated_at=later,  # touched by earlier user activity
+        input_tokens=1200,  # turns ran before the rewind emptied the transcript
+        output_tokens=340,
+    )
+    source = SessionSource(platform=Platform.SLACK, chat_id="C1", user_id="U1")
+
+    runner.async_session_store = SimpleNamespace(
+        load_transcript=AsyncMock(return_value=[])
+    )
+
+    was_auto_reset, is_new_session = await runner._hmwa_open_session(
+        entry, entry.session_key, source
+    )
+
+    assert was_auto_reset is False
+    assert is_new_session is False
+    runner.hooks.emit.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_retry_replay_preserves_auto_skill(tmp_path, monkeypatch):
+    """/retry replays the last user message as a new turn: it must forward
+    event.auto_skill like /queue and /goal kickoff do (#130381 P2)."""
+    import hermes_state
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+
+    config = GatewayConfig()
+    store = SessionStore(sessions_dir=tmp_path, config=config)
+
+    session_id = "retry_skill_session"
+    store._db.create_session(session_id=session_id, source="test")
+    for msg in [
+        {"role": "user", "content": "orig question"},
+        {"role": "assistant", "content": "orig answer"},
+    ]:
+        store.append_to_transcript(session_id, msg)
+
+    gw = GatewayRunner.__new__(GatewayRunner)
+    gw.config = config
+    gw.session_store = store
+    session_entry = MagicMock(session_id=session_id)
+    session_entry.last_prompt_tokens = 0
+    gw.session_store.get_or_create_session = MagicMock(return_value=session_entry)
+
+    seen = {}
+
+    async def fake_handle_message(event):
+        seen["auto_skill"] = event.auto_skill
+        return "ok"
+
+    gw._handle_message = AsyncMock(side_effect=fake_handle_message)
+    source = SessionSource(platform=Platform.SLACK, chat_id="C1", user_id="U1")
+    event = MessageEvent(
+        text="/retry", message_type=MessageType.TEXT, source=source,
+        auto_skill=["incident-investigator"],
+    )
+
+    assert await gw._handle_retry_command(event) == "ok"
+    assert seen["auto_skill"] == ["incident-investigator"]
+
+
+@pytest.mark.asyncio
+async def test_steer_fallback_preserves_auto_skill():
+    """/steer queued as a follow-up turn (no running agent) must forward
+    event.auto_skill like /queue does (#130381 P2)."""
+    runner = _GoalTestRunner()
+    runner._peek_session_state = lambda quick_key: None
+    runner._delivery_adapter_for = lambda source: object()
+    source = SessionSource(platform=Platform.SLACK, chat_id="C1", user_id="U1")
+    event = MessageEvent(
+        text="/steer focus on latency", message_type=MessageType.TEXT, source=source,
+        auto_skill=["incident-investigator"],
+    )
+
+    await runner._busy_steer_command(event, "slack:C1:U1", source)
+
+    assert len(runner.enqueued) == 1
+    assert runner.enqueued[0].auto_skill == ["incident-investigator"]
