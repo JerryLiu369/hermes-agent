@@ -807,10 +807,20 @@ class SessionMessagesMixin:
         the transcript doubles on every retry. Skipped dicts adopt the stored
         row's ``_row_id``/identity and marker so later flushes keep skipping
         them instead of retrying the insert.
+
+        The guard only collapses against rows durable *before* this call.
+        Twins arriving in the same batch are distinct occurrences and each gets
+        its own row with a freshly minted uid (#130112): import ships an
+        archived row and its live carried clone (byte-identical by design) in
+        one batch, and collapsing them hands the shared row to the archival
+        UPDATE, losing the live turn from model context. Likewise an
+        archived-designated dict matching a live stored row is inserted
+        separately instead of adopting the live row's id.
         """
         now_ts = time.time()
         inserted = tool_calls_total = 0
         batch_tool_index: Dict[str, str] = {}
+        batch_keys: set = set()
         existing_by_key = self._existing_transcript_keys(conn, session_id, messages)
         for msg in messages:
             role = msg.get("role", "unknown")
@@ -822,7 +832,11 @@ class SessionMessagesMixin:
                           msg.get("tool_call_id"), encoded_tool_calls,
                           _scrub_surrogates(msg.get("tool_name")))
             duplicate_row = existing_by_key.get(dedupe_key)
-            if duplicate_row is not None:
+            try:
+                msg_active = int(msg.get("active", 1) if msg.get("active") is not None else 1)
+            except (TypeError, ValueError):
+                msg_active = 1
+            if duplicate_row is not None and dedupe_key not in batch_keys and msg_active != 0:
                 # Already durable: adopt the stored identity instead of doubling the row.
                 try:
                     _restore_identity_columns(duplicate_row, msg)
@@ -848,6 +862,12 @@ class SessionMessagesMixin:
             # The durable per-message id: kept when the dict carries one (a copy of an already-stored
             # message), minted and stamped on the dict otherwise. Stamped BEFORE the bind so the row and
             # the live dict never disagree. Tool calls get their per-occurrence ids the same way.
+            # Same-call twins (duplicate_row hit while the key is already in
+            # batch_keys, or an archived twin of a live stored row) are distinct
+            # occurrences: drop any carried uid so each twin mints its own
+            # instead of sharing the first twin's identity (#130112).
+            if duplicate_row is not None:
+                msg.pop(MESSAGE_UID, None)
             stamp_message_uid(msg)
             self._stamp_tool_call_uids(msg, tool_calls, batch_tool_index)
             cur = conn.execute(_INSERT_MESSAGE_SQL, self._message_row_params(
@@ -859,6 +879,7 @@ class SessionMessagesMixin:
             msg["timestamp"] = message_timestamp
             if cur.lastrowid is not None:
                 msg["_row_id"] = cur.lastrowid
+            batch_keys.add(dedupe_key)
             inserted += 1
             tool_calls_total += _tool_calls_count(tool_calls)
             now_ts = max(now_ts, message_timestamp) + 1e-6
