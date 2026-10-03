@@ -162,3 +162,65 @@ def probe_runtime_status_file(path: str) -> Optional[Dict[str, Any]]:
     except Exception:
         return None
     return data if isinstance(data, dict) else None
+
+
+#: gateway_state values that count as alive for Tier-1 freshness (mirrors
+#: ``gateway/status.py::_DRAINABLE_GATEWAY_STATES``).
+REMOTE_FRESH_STATES = frozenset({"running", "degraded"})
+
+#: Max age of the peer's ``updated_at`` before its liveness claim is suspect
+#: (mirrors ``gateway/status.py::_RUNTIME_STATUS_STALE_TTL_S``).
+FRESHNESS_TTL_S = 120
+
+
+def evaluate_freshness(
+    gateway_state: Any, updated_at: Any, now: Optional[float] = None,
+) -> Tuple[bool, str]:
+    """Tier-1 freshness over one ``/health/detailed`` payload.
+
+    Returns ``(fresh, reason)``: the peer must report a live ``gateway_state``
+    AND a recent ``updated_at``. A missing ``updated_at`` fails closed here
+    (unlike Tier 2's fail-open): without any recency signal there is no proof
+    the process that wrote the state is still alive.
+    """
+    import datetime
+    import time as _time
+
+    state = str(gateway_state or "").strip().lower()
+    if state not in REMOTE_FRESH_STATES:
+        return False, f"gateway_state is {gateway_state!r}, not a live state"
+    if not isinstance(updated_at, str) or not updated_at.strip():
+        return False, "no updated_at in the health payload; freshness unproven"
+    try:
+        stamp = datetime.datetime.fromisoformat(updated_at.strip().replace("Z", "+00:00"))
+        age_s = (_time.time() if now is None else now) - stamp.timestamp()
+    except (ValueError, OverflowError):
+        return False, f"unparseable updated_at {updated_at!r}"
+    if age_s > FRESHNESS_TTL_S:
+        return False, f"updated_at is {age_s:.0f}s old (stale writer?)"
+    return True, "live state with a fresh heartbeat"
+
+
+def evaluate_remote_gate(payload: Any) -> Dict[str, Any]:
+    """Tier-1 + Tier-2 over one ``GET /health/detailed`` response dict.
+
+    Returns a JSON-able result with ``healthy`` (both tiers), the Tier-1
+    verdict and the Tier-2 ``(all, connected, missing)`` populations.
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    fresh, fresh_reason = evaluate_freshness(payload.get("gateway_state"), payload.get("updated_at"))
+    runtime_shaped = {
+        "platforms": payload.get("platforms", {}),
+        "pid": payload.get("pid"),
+        "start_time": payload.get("start_time"),
+    }
+    tier2_ok, all_p, conn_p, missing = evaluate_platform_gate(runtime_shaped)
+    return {
+        "healthy": bool(fresh and tier2_ok),
+        "tier1_fresh": fresh,
+        "tier1_reason": fresh_reason,
+        "tier2_healthy": tier2_ok,
+        "all_owned": all_p,
+        "connected_owned": conn_p,
+        "missing": missing,
+    }
