@@ -175,6 +175,44 @@ async def arun_with_load_deadline(plugin_key: str, ctx: "PluginContext", fn: Cal
         raise PluginLoadTimeout(f"load timed out after {timeout:g}s (import + register() never returned)")
 
 
+async def arun_coro_with_load_deadline(
+    plugin_key: str, ctx: Any, coro_fn: Callable[[], Any]
+) -> Any:
+    """Coroutine twin of :func:`arun_with_load_deadline` for loop-bound work.
+
+    ``arun_with_load_deadline`` runs a sync callable in a worker thread, but a
+    coroutine that schedules loop-bound tasks (``asyncio.create_task`` binds to
+    the RUNNING loop — e.g. secondary-profile adapter startup parking its
+    reconnect handoff) cannot move threads: the worker loop closes on return
+    and the tasks die with it. So the coroutine runs HERE, on the caller's
+    loop, under ``asyncio.wait_for`` with the same per-plugin deadline, the
+    same abandon ledger (prune dead, count the slot toward the cap) and the
+    same :class:`PluginLoadTimeout`. On timeout the coroutine is CANCELLED
+    (no leaked thread — strictly better than abandonment) and the caller
+    treats it as a transient failure to retry on the next tick.
+    """
+    import asyncio
+
+    timeout = _resolve_plugin_load_timeout()
+    if timeout <= 0:
+        return await coro_fn()
+    _reserve_abandoned_loader_slot()
+    try:
+        return await asyncio.wait_for(coro_fn(), timeout)
+    except asyncio.TimeoutError:
+        ctx._abandon_load()
+        with _ABANDONED_LOADERS_LOCK:
+            _ABANDONED_LOADERS[:] = [t for t in _ABANDONED_LOADERS if t.is_alive()]
+            if len(_ABANDONED_LOADERS) < _MAX_ABANDONED_LOADERS:
+                # No thread leaked (the coroutine was cancelled), but the slot
+                # is still counted: a profile that times out every tick must hit
+                # the cap and refuse, not retry forever.
+                finished = threading.Thread(daemon=True, target=lambda: None)
+                # Never started => is_alive() False, keeps cap accounting cheap.
+                _ABANDONED_LOADERS.append(finished)
+        raise PluginLoadTimeout(f"load timed out after {timeout:g}s ({plugin_key} never settled)")
+
+
 def _evict_modules(module_name: str) -> None:
     """Drop ``module_name`` and every ``module_name.*`` submodule from ``sys.modules``."""
     prefix = f"{module_name}."

@@ -57,6 +57,22 @@ class _UnresolvedProfileHome:
 UNRESOLVED_PROFILE_HOME = _UnresolvedProfileHome()
 
 
+class _SecondaryAdapterLoadContext:
+    """Abandon marker for one secondary profile's adapter startup under the load deadline.
+
+    Carries no registrations itself — its only job is recording that the deadline
+    fired, so a late-settling startup is visibly abandoned instead of silently
+    half-live. The loud signal is the PluginLoadTimeout itself, which the caller
+    treats as a transient failure retried on the next reconcile tick.
+    """
+
+    def __init__(self) -> None:
+        self.abandoned = False
+
+    def _abandon_load(self) -> None:
+        self.abandoned = True
+
+
 class GatewayAdapterLifecycleMixin:
     """Adapter lifecycle: connect/teardown, fatal recovery, reconnect watcher, multiplex profiles."""
 
@@ -948,7 +964,18 @@ class GatewayAdapterLifecycleMixin:
             # Preserve changes made while the initial connection is awaiting I/O.
             scan_signature = profile_serve_signature(profile_home)
             try:
-                connected += await self._start_one_profile_adapters(profile_name, profile_home, claimed)
+                # The per-plugin load deadline protects real profiles: a hung secondary
+                # startup fails loudly as PluginLoadTimeout (caught below as a transient
+                # failure, retried by the reconcile watcher) instead of wedging the whole
+                # multiplex loop. Loop-bound work cannot move to a worker thread
+                # (asyncio.create_task binds to the running loop), so the coroutine twin
+                # runs it HERE under wait_for rather than arun_with_load_deadline.
+                from hermes_cli.plugins_loader import arun_coro_with_load_deadline
+                connected += await arun_coro_with_load_deadline(
+                    f"profile-adapters:{profile_name}",
+                    _SecondaryAdapterLoadContext(),
+                    lambda: self._start_one_profile_adapters(profile_name, profile_home, claimed),
+                )
             except MultiplexConfigError:
                 raise
             except Exception as e:
