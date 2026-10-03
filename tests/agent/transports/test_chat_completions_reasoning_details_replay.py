@@ -93,3 +93,46 @@ def test_openrouter_gemini_preserves_thought_signature_while_stripping_reasoning
     assert assistant_wire["tool_calls"][0]["extra_content"] == {"thought_signature": "sig_xyz"}
     # Original history unmodified
     assert "reasoning_details" in history_with_signature[1]
+
+
+def test_build_kwargs_falls_back_to_profile_base_url_for_routing():
+    """Pin for #129400 review: an empty agent ``base_url`` resolves from the registered
+    provider profile, so route-scoped stripping follows the profile route.
+
+    Reverting the ``params.get("base_url") or getattr(_profile, "base_url", None)``
+    fallback in build_kwargs leaves every other test green but fails this one:
+    without the profile route, a replayable model on OpenRouter gets stripped.
+    """
+    from types import SimpleNamespace
+
+    transport = get_transport("chat_completions")
+    assert transport is not None
+
+    def _profile(base_url):
+        return SimpleNamespace(
+            base_url=base_url,
+            fixed_temperature=None,
+            supports_prompt_cache_key=False,
+            prepare_messages=lambda msgs: msgs,
+            get_max_tokens=lambda model: None,
+            build_api_kwargs_extras=lambda **kwargs: ({}, {}),
+            build_extra_body=lambda **kwargs: {},
+        )
+
+    openrouter = _profile("https://openrouter.ai/api/v1")
+    replay_model = "deepseek/deepseek-r1"
+
+    # No agent base_url: the OpenRouter profile route replays reasoning_details.
+    kwargs = transport.build_kwargs(replay_model, _HISTORY, provider_profile=openrouter)
+    assert any("reasoning_details" in m for m in kwargs["messages"])
+    # Empty-string agent base_url: the fallback still engages.
+    kwargs = transport.build_kwargs(replay_model, _HISTORY, provider_profile=openrouter, base_url="")
+    assert any("reasoning_details" in m for m in kwargs["messages"])
+    assert "reasoning_details" in _HISTORY[1]  # durable history is untouched
+
+    # An explicit agent base_url wins over the profile route.
+    kwargs = transport.build_kwargs(
+        replay_model, _HISTORY, provider_profile=openrouter,
+        base_url="https://api.groq.com/openai/v1",
+    )
+    assert all("reasoning_details" not in m for m in kwargs["messages"])
