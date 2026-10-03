@@ -1205,9 +1205,7 @@ class SessionSessionsMixin:
         compression_parent_edge = f"""
             parent.end_reason = 'compression'
             AND child.parent_session_id = parent.id
-            AND json_extract(
-                COALESCE(child.model_config, '{{}}'), '$._branched_from'
-            ) IS NULL
+            AND {_sql_json_extract('child.model_config', '$._branched_from')} IS NULL
             AND {_delegate_from_json('child.model_config')} IS NULL
             AND COALESCE(child.source, '') != 'tool'
         """

@@ -78,3 +78,53 @@ def test_legal_empty_shapes_still_merge_normally(db, raw):
 
     meta = db.get_session("s1")
     assert json.loads(meta["model_config"]) == {"yolo_mode": True}
+
+
+@pytest.mark.parametrize("raw", [5, 3.14])
+def test_non_string_model_config_preserved(db, caplog, raw):
+    """Non-str/dict/None storage values (``else`` arm) refuse the merge.
+
+    ``sessions.model_config`` is a TEXT column so integers/floats cannot
+    round-trip through SQLite itself; the raw value is fed to the real
+    ``_merge_model_config_json`` via a minimal stub cursor. Reverting the
+    ``else`` arm to ``config = {}`` turns this red (the patch would apply).
+    """
+    class _StubConn:
+        def execute(self, *args):
+            class _Cursor:
+                def fetchone(self):
+                    return (raw,)
+            return _Cursor()
+
+    with caplog.at_level(logging.ERROR, logger="hermes_state"):
+        merged = db._merge_model_config_json(
+            _StubConn(), "s1", {"yolo_mode": True}
+        )
+
+    assert merged == raw
+    assert any(
+        r.levelno >= logging.ERROR and "refusing to merge" in r.message
+        for r in caplog.records
+    )
+
+
+def test_picker_survives_corrupt_model_config(db):
+    """``list_recent_sessions_bounded`` must not raise on malformed JSON.
+
+    The ``compression_parent_edge`` marker lookup is guarded by
+    ``_sql_json_extract`` (``json_valid``), so a corrupt child row is
+    treated as marker-absent instead of raising ``sqlite3.OperationalError``.
+    """
+    db.create_session(session_id="parent", source="cli", model="m")
+    db.create_session(session_id="child", source="cli", model="m")
+    db._conn.execute(
+        "UPDATE sessions SET end_reason = 'compression' WHERE id = 'parent'"
+    )
+    db._conn.execute(
+        "UPDATE sessions SET parent_session_id = 'parent' WHERE id = 'child'"
+    )
+    _store_raw_model_config(db, "child", '{"_branched_from": "parent_x", "yolo')
+    db._conn.commit()
+
+    rows = db.list_recent_sessions_bounded(limit=20)
+    assert isinstance(rows, list)
