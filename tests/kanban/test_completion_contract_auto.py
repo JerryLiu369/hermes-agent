@@ -219,6 +219,10 @@ def test_default_spawn_pins_auto_contract_env(monkeypatch, tmp_path):
     root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
     monkeypatch.setenv("HERMES_HOME", str(root))
     monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    # _default_spawn registers the proc in kbd._live_worker_procs; isolate it
+    # so the FakeProc (no .poll()) never leaks into the zombie reaper of a
+    # later test on the Windows branch (#130916 review).
+    monkeypatch.setattr(kbd, "_live_worker_procs", {})
     captured = {}
 
     class FakeProc:
