@@ -343,3 +343,44 @@ class TestEndToEndNoSideEffects:
         finally:
             tt.set_approval_callback(None)
             hc._LOAD_CONFIG_CACHE.clear()
+
+
+class TestFailurePathErrorContract:
+    """Failure SEAMS still surface the public error envelope through the real tool.
+
+    force=True skips only the approval gate; planning, env acquisition and the
+    foreground run are real. Only the failing seam is stubbed — no raw
+    exception may escape terminal_tool(), and the monitoring wrapper
+    (record_terminal_backend) still sees a well-formed envelope.
+    """
+
+    def test_acquire_env_failure_returns_error_envelope(self, monkeypatch):
+        """_create_configured_env raising (daemon down) => fatal error envelope."""
+        monkeypatch.setattr(tt, "_plan_execution", lambda *_a, **_k: _fake_plan())
+
+        def _boom(*_a, **_k):
+            raise RuntimeError("docker daemon unreachable (connection refused)")
+
+        monkeypatch.setattr(tt, "_create_configured_env", _boom)
+        result = json.loads(tt.terminal_tool("echo ok", force=True, task_id="e2e-130890-acquire-fail"))
+        assert result["status"] == "error"
+        assert result["exit_code"] == -1
+        assert "Failed to execute command" in result["error"]
+        assert "docker daemon unreachable" in result["error"]
+
+    def test_env_execute_throw_returns_timeout_contract(self, monkeypatch):
+        """env.execute raising a connect timeout => the exit-124 timeout envelope."""
+        monkeypatch.setattr(tt, "_plan_execution", lambda *_a, **_k: _fake_plan())
+
+        class _DeadEnv:
+            host_cwd = None
+
+            def execute(self, *_a, **_k):
+                raise ConnectionError("ssh connect timeout after 10s")
+
+        monkeypatch.setattr(tt, "_create_configured_env", lambda *_a, **_k: _DeadEnv())
+        result = json.loads(
+            tt.terminal_tool("echo ok", force=True, task_id="e2e-130890-exec-timeout")
+        )
+        assert result["exit_code"] == 124
+        assert "timed out" in result["error"].lower()
