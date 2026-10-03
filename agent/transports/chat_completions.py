@@ -34,12 +34,14 @@ _XAI_TOOL_SEARCH_ALIAS = "hermes_tool_search"
 
 # Persistence-only / cross-transport message keys that strict OpenAI-compatible
 # providers reject with HTTP 400/422 ("Extra inputs are not permitted" / "extra_forbidden",
-# e.g. Mistral on ``reasoning_details`` — #130757). ``reasoning`` is trajectory-only
-# (replayed as ``reasoning_content`` for thinking models); it never belongs on the wire.
+# e.g. Mistral on ``reasoning_details`` — #130757). ``reasoning`` is NOT stripped here:
+# the auxiliary/MoA lanes carry it back via prepare_chat_messages (no
+# reasoning->reasoning_content promotion there), so it is stripped only on the
+# agent build path (build_kwargs -> convert_messages(strip_reasoning=True));
+# the main path also pops it in turn_context after promotion.
 _STRIP_MSG_KEYS = (
     "codex_reasoning_items", "codex_message_items", "tool_name", "effect_disposition", "timestamp",
     "platform_message_id", "api_content", "anthropic_content_blocks", "bedrock_content_blocks", MESSAGE_UID,
-    "reasoning",
 )
 _STRIP_TC_KEYS = ("call_id", "response_item_id")
 _HIGH_EFFORTS = {"high", "xhigh", "max", "ultra"}
@@ -378,13 +380,14 @@ def _finish_kwargs(api_kwargs: dict[str, Any], sanitized: list, params: dict, *,
 
 def _sanitize_message(
     msg: Any, strip_extra_content: bool, strip_reasoning_details: bool = False,
-    native_reasoning_details_type: str | None = None,
+    native_reasoning_details_type: str | None = None, strip_reasoning: bool = False,
 ) -> dict | None:
     """Sanitized copy of ``msg``, or None when nothing needs stripping.
 
-    Drops persistence sidecars, trajectory-only ``reasoning`` (replayed as
-    ``reasoning_content`` for thinking models; strict providers reject it with
-    ``extra_forbidden``), ``_``-prefixed scaffolding markers, tool-call ``call_id`` /
+    Drops persistence sidecars, ``_``-prefixed scaffolding markers, trajectory-only
+    ``reasoning`` (only when ``strip_reasoning`` — the agent build path; the
+    auxiliary/MoA lane carries it back, and the main path promotes it to
+    ``reasoning_content`` in turn_context first), tool-call ``call_id`` /
     ``response_item_id`` (and ``extra_content`` unless Gemini), an assistant
     ``tool_calls: []`` / ``null`` (strict providers reject both), ``name``
     on tool results (schema-valid only on user/assistant messages; strict
@@ -398,6 +401,8 @@ def _sanitize_message(
     if not isinstance(msg, dict):
         return None
     strip_keys = [k for k in msg if k in _STRIP_MSG_KEYS or (isinstance(k, str) and k.startswith("_"))]
+    if strip_reasoning and "reasoning" in msg:
+        strip_keys.append("reasoning")
     kept_details = None
     if strip_reasoning_details and "reasoning_details" in msg:
         strip_keys.append("reasoning_details")
@@ -454,13 +459,18 @@ class ChatCompletionsTransport(ProviderTransport):
     def convert_messages(self, messages: list[dict[str, Any]], **kwargs) -> list[dict[str, Any]]:
         """Strip internal fields that strict chat-completions providers reject (HTTP 400/422).
 
-        Returns the input list unchanged when nothing needs sanitizing.
+        ``strip_reasoning`` is build-path only: the agent build (build_kwargs) sets
+        it so trajectory-only ``reasoning`` never reaches the wire (the main path
+        promotes it to ``reasoning_content`` in turn_context first); the
+        auxiliary/MoA lane (prepare_chat_messages) omits it and carries
+        ``reasoning`` back. Returns the input list unchanged when nothing needs sanitizing.
         """
         strip_extra_content = not _model_consumes_thought_signature(kwargs.get("model"))
         # A profile declaring a native carrier type consumes replayed details by contract.
         native_type = getattr(kwargs.get("provider_profile"), "native_reasoning_details_type", None) or None
         strip_reasoning_details = not (native_type or _route_replays_reasoning_details(kwargs.get("base_url")))
-        sanitized_pairs = [(m, _sanitize_message(m, strip_extra_content, strip_reasoning_details, native_type))
+        strip_reasoning = bool(kwargs.get("strip_reasoning", False))
+        sanitized_pairs = [(m, _sanitize_message(m, strip_extra_content, strip_reasoning_details, native_type, strip_reasoning))
                            for m in messages]
         if all(s is None for _, s in sanitized_pairs):
             return messages
@@ -479,7 +489,7 @@ class ChatCompletionsTransport(ProviderTransport):
         path below (is_kimi, is_openrouter, ...) is only reached for unregistered providers.
         """
         _profile = params.get("provider_profile")
-        sanitized = self.convert_messages(messages, model=model, base_url=params.get("base_url"), provider_profile=_profile)
+        sanitized = self.convert_messages(messages, model=model, base_url=params.get("base_url"), provider_profile=_profile, strip_reasoning=True)
         if _profile:
             return self._build_kwargs_from_profile(_profile, model, sanitized, tools, params)
 
