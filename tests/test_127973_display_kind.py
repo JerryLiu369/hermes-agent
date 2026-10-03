@@ -293,3 +293,22 @@ def test_system_notice_write_site_is_hidden():
     src = pathlib.Path("tui_gateway/server.py").read_text()
     assert "display_kind" in src and "hidden" in src
     assert "[System:" in src
+
+
+def test_model_switch_marker_stays_visible_model_switch():
+    """Model-switch markers are stamped model_switch and stay visible.
+
+    Guards the #130230 mutation: silently reclassifying the marker as hidden
+    would drop the pivot notice from the transcript unnoticed. The persistence
+    tail warns-and-skips without an agent, but the in-memory entry is what
+    renders — pin exactly that.
+    """
+    from tui_gateway.server import _append_model_switch_marker, _is_model_switch_marker
+
+    session = {"session_key": "pin-model-switch"}
+    _append_model_switch_marker(session, model="test-model", provider="")
+    assert len(session["history"]) == 1
+    entry = session["history"][0]
+    assert _is_model_switch_marker(entry)
+    assert entry["display_kind"] == "model_switch", (
+        "model-switch markers must stay visible, never hidden")
