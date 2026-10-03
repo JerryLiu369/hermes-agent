@@ -312,3 +312,73 @@ def test_blocked_split_hermes_gateway_in_program_arguments(tmp_path):
     _track(repo, plist)
     cmd = f"launchctl bootstrap gui/501 {plist}"
     assert contains_launchctl_submit_command(cmd, cwd=str(repo)) is True
+
+
+def _payload_plist(label: str) -> dict:
+    return {
+        "Label": label,
+        "ProgramArguments": ["/bin/echo", "hermes-gateway"],
+        "KeepAlive": True,
+        "RunAtLoad": True,
+    }
+
+
+def test_blocked_multi_path_payload_first_decoy_last(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    payload = repo / "com.example.payload.plist"
+    _write_plist(payload, _payload_plist("com.example.payload"))
+    decoy = repo / "com.example.decoy.plist"
+    _write_plist(decoy, _inert_payload("com.example.decoy"))
+    _track(repo, payload)
+    _track(repo, decoy)
+    cmd = f"launchctl bootstrap gui/501 {payload} {decoy}"
+    assert contains_launchctl_submit_command(cmd, cwd=str(repo)) is True
+    assert scan_gateway_lifecycle(cmd, cwd=str(repo))[0] is True
+
+
+def test_blocked_multi_path_decoy_first_payload_last(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    payload = repo / "com.example.payload.plist"
+    _write_plist(payload, _payload_plist("com.example.payload"))
+    decoy = repo / "com.example.decoy.plist"
+    _write_plist(decoy, _inert_payload("com.example.decoy"))
+    _track(repo, payload)
+    _track(repo, decoy)
+    cmd = f"launchctl bootstrap gui/501 {decoy} {payload}"
+    assert contains_launchctl_submit_command(cmd, cwd=str(repo)) is True
+    assert scan_gateway_lifecycle(cmd, cwd=str(repo))[0] is True
+
+
+def test_allowed_multi_path_all_inert(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    first = repo / "com.example.first.plist"
+    _write_plist(first, _inert_payload("com.example.first"))
+    second = repo / "com.example.second.plist"
+    _write_plist(second, _inert_payload("com.example.second"))
+    _track(repo, first)
+    _track(repo, second)
+    cmd = f"launchctl bootstrap gui/501 {first} {second}"
+    assert contains_launchctl_submit_command(cmd, cwd=str(repo)) is False
+    assert scan_gateway_lifecycle(cmd, cwd=str(repo))[0] is False
+
+
+def test_blocked_multi_path_first_plist_helper_restart(tmp_path):
+    repo = tmp_path / "repo"
+    _init_repo(repo)
+    helper = repo / "helper.sh"
+    helper.write_text("#!/bin/sh\nhermes gateway restart\n", encoding="utf-8")
+    first = repo / "com.example.first.plist"
+    _write_plist(
+        first,
+        {"Label": "com.example.first", "ProgramArguments": ["/bin/sh", "helper.sh"]},
+    )
+    second = repo / "com.example.second.plist"
+    _write_plist(second, _inert_payload("com.example.second"))
+    _track(repo, first)
+    _track(repo, second)
+    cmd = f"launchctl bootstrap gui/501 {first} {second}"
+    assert contains_launchctl_submit_command(cmd, cwd=str(repo)) is False
+    assert scan_gateway_lifecycle(cmd, cwd=str(repo))[0] is True

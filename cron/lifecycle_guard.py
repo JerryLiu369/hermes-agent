@@ -872,18 +872,27 @@ def _resolve_script_directory(script_path: str) -> Optional[str]:
 _DECLARED_GATEWAY_SUBSTRING_RE = re.compile(r"(?i)hermes[.\-]?gateway")
 
 
-def _extract_bootstrap_plist_candidate(segment: list[str], index: int) -> Optional[str]:
-    """Candidate plist path from ``launchctl bootstrap <domain> <plist>``: last token after the verb."""
+def _extract_bootstrap_plist_candidates(segment: list[str], index: int) -> list[str]:
+    """Service paths from ``launchctl bootstrap <domain> <svc> [svc ...]``: every positional token
+    after the domain target. ``launchctl bootstrap`` registers ALL of them, so the guard must
+    validate every one — checking only the last lets ``bootstrap gui/501 <payload> <decoy>`` carve
+    out as safe while launchd installs the payload too."""
     try:
         args = segment[index + 1 :]
     except Exception:
-        return None
+        return []
     if not args or args[0].lower() != "bootstrap":
-        return None
+        return []
     rest = args[1:]
-    if not rest:
-        return None
-    return rest[-1]
+    if len(rest) < 2:
+        return []
+    return rest[1:]
+
+
+def _extract_bootstrap_plist_candidate(segment: list[str], index: int) -> Optional[str]:
+    """Candidate plist path from ``launchctl bootstrap <domain> <plist>``: last token after the verb."""
+    candidates = _extract_bootstrap_plist_candidates(segment, index)
+    return candidates[-1] if candidates else None
 
 
 def _resolve_declared_plist_path(candidate: str, cwd: Optional[str]) -> Optional[Path]:
@@ -962,17 +971,14 @@ def _load_declared_plist_dict(plist: Path) -> Optional[dict]:
     return parsed if isinstance(parsed, dict) else None
 
 
-def _declared_launchd_target(segment: list[str], index: int, cwd: Optional[str]) -> bool:
-    """Whether ``launchctl bootstrap`` at *index* installs a repo-declared inert job.
+def _is_single_declared_inert_plist(candidate: str, cwd: str) -> bool:
+    """Whether one bootstrap service path is a repo-declared inert job.
 
     All must hold: plist is a regular file inside *cwd*, git-tracked and clean, Label equals the
     filename stem, KeepAlive absent, RunAtLoad absent/False, and no gateway/XPC token in Label,
     Program or ProgramArguments. Any failure fails closed (False = still blocked).
     """
     try:
-        candidate = _extract_bootstrap_plist_candidate(segment, index)
-        if not candidate or not cwd:
-            return False
         resolved = _resolve_declared_plist_path(candidate, cwd)
         if resolved is None:
             return False
@@ -1032,35 +1038,54 @@ def _declared_launchd_target(segment: list[str], index: int, cwd: Optional[str])
         return False
 
 
+def _declared_launchd_target(segment: list[str], index: int, cwd: Optional[str]) -> bool:
+    """Whether ``launchctl bootstrap`` at *index* installs only repo-declared inert jobs.
+
+    ``launchctl bootstrap`` registers EVERY service path after the domain target, so the carve-out
+    holds only when ALL of them are declared-safe; any unresolvable/unsafe path fails closed
+    (False = still blocked).
+    """
+    try:
+        if not cwd:
+            return False
+        candidates = _extract_bootstrap_plist_candidates(segment, index)
+        if not candidates:
+            return False
+        return all(_is_single_declared_inert_plist(candidate, cwd) for candidate in candidates)
+    except Exception:
+        return False
+
+
 def _iter_declared_plist_executables(
     segment: list[str], index: int, cwd: Optional[str]
 ) -> Iterator[Path]:
-    """Yield Program/ProgramArguments paths from a declared plist so the walk scans them."""
+    """Yield Program/ProgramArguments paths from declared plists so the walk scans them."""
     try:
-        candidate = _extract_bootstrap_plist_candidate(segment, index)
-        if not candidate:
+        candidates = _extract_bootstrap_plist_candidates(segment, index)
+        if not candidates:
             return
-        resolved = _resolve_declared_plist_path(candidate, cwd)
-        if resolved is None:
-            return
-        data = _load_declared_plist_dict(resolved)
-        if data is None:
-            return
-        candidates: list[str] = []
-        program = data.get("Program")
-        if isinstance(program, str) and program.strip():
-            candidates.append(program)
-        program_args = data.get("ProgramArguments")
-        if isinstance(program_args, (list, tuple)):
-            for item in program_args:
-                if isinstance(item, str) and item.strip():
-                    candidates.append(item)
-        plist_parent = str(resolved.parent)
-        for entry in candidates:
-            for base in (cwd, plist_parent):
-                if base is None:
-                    continue
-                yield from _resolved_or_nothing(entry, base)
+        for candidate in candidates:
+            resolved = _resolve_declared_plist_path(candidate, cwd)
+            if resolved is None:
+                continue
+            data = _load_declared_plist_dict(resolved)
+            if data is None:
+                continue
+            entries: list[str] = []
+            program = data.get("Program")
+            if isinstance(program, str) and program.strip():
+                entries.append(program)
+            program_args = data.get("ProgramArguments")
+            if isinstance(program_args, (list, tuple)):
+                for item in program_args:
+                    if isinstance(item, str) and item.strip():
+                        entries.append(item)
+            plist_parent = str(resolved.parent)
+            for entry in entries:
+                for base in (cwd, plist_parent):
+                    if base is None:
+                        continue
+                    yield from _resolved_or_nothing(entry, base)
     except Exception:
         return
 
