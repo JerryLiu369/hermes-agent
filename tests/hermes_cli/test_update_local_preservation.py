@@ -667,3 +667,56 @@ def test_settle_writes_receipt_and_desktop_fact(tmp_path, monkeypatch):
     summary = _latest_update_receipt_summary()
     # No active receipt outside the probe: the summary helper fails closed.
     assert summary is None or isinstance(summary, dict)
+
+
+def test_failed_untracked_group_does_not_wipe_successful_tracked_group(tmp_path, monkeypatch):
+    """Cross-group isolation: a later group's failure must not wipe an earlier success.
+
+    The exact gap in the suite (#130902): tracked applies cleanly and validates,
+    then untracked fails validation (syntax-broken file). The tracked content must
+    survive in the tree, its receipt must stay truthfully active, the untracked
+    stash must survive with its handle, and only the untracked paths revert.
+    """
+    _init_repo(tmp_path)
+    # Keep HERMES_HOME outside the repo: the global pytest sandbox materializes
+    # the home (SOUL.md, logs) inside tmp_path, and preserve would stash those
+    # home files into the untracked group — then validation's import probe
+    # recreates SOUL.md mid-restore and the untracked apply conflicts with
+    # itself. Real layouts never nest the home inside the repo.
+    outside_home = tmp_path.parent / f"{tmp_path.name}-home"
+    outside_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(outside_home))
+    monkeypatch.setenv("HERMES_TEST_ISOLATION", str(outside_home))
+    (tmp_path / "keep.py").write_text("X = 1\n")
+    _git(tmp_path, "add", "keep.py")
+    _git(tmp_path, "commit", "-qm", "base")
+    _git(tmp_path, "update-ref", "refs/remotes/origin/main", "HEAD")
+    (tmp_path / "keep.py").write_text("X = 2  # MY_LOCAL\n")
+    (tmp_path / "broken_local.py").write_text("def broken(:\n")
+    state = pres.preserve_local_changes(GIT, tmp_path, "origin/main", stamp="XGRP")
+    assert state.groups["tracked"].present and state.groups["untracked"].present
+    # Upstream advances an unrelated file.
+    (tmp_path / "b.txt").write_text("b\n")
+    _git(tmp_path, "add", "b.txt")
+    _git(tmp_path, "commit", "-qm", "upstream")
+
+    outcome = pres.restore_preserved_groups(
+        GIT, tmp_path, state, policy="safe", keep_stash=False)
+
+    assert outcome["tracked"]["status"] == "active", outcome
+    assert outcome["untracked"]["status"] == "inactive", outcome
+    assert "validation" in outcome["untracked"]["reason"]
+    # The successful group's content survived the later group's failure.
+    assert (tmp_path / "keep.py").read_text() == "X = 2  # MY_LOCAL\n"
+    # The failed group's file is gone from the tree but its stash survives.
+    assert not (tmp_path / "broken_local.py").exists()
+    assert state.groups["untracked"].ref in _stash_shas(tmp_path)
+    # The successful group's stash was dropped (normal) — and the receipt's
+    # active claim is backed by content actually in the tree.
+    assert state.groups["tracked"].ref not in _stash_shas(tmp_path)
+    receipt = pres.write_preservation_receipt(
+        tmp_path, state, "upstream-rev", outcome, policy="safe", keep_stash=False)
+    payload = json.loads(receipt.read_text(encoding="utf-8"))
+    assert payload["active_groups"] == ["tracked"]
+    assert "MY_LOCAL" in (tmp_path / "keep.py").read_text()
+    pres.clear_in_progress_marker(tmp_path)

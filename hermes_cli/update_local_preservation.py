@@ -571,6 +571,74 @@ def _reset_after_failed_apply(git_cmd, repo_root, untracked_before: set) -> None
     _git_run(git_cmd, ["reset", "--hard", "HEAD"], repo_root)
 
 
+def _tracked_dirty_paths(git_cmd, repo_root) -> Optional[set]:
+    """Tracked paths differing from HEAD (staged, unstaged or unmerged)."""
+    result = _git_run(
+        git_cmd, ["status", "--porcelain=v1", "-z", "--untracked-files=no"], repo_root
+    )
+    if result.returncode != 0:
+        return None
+    dirty = set()
+    for entry in (result.stdout or "").split("\0"):
+        if not entry:
+            continue
+        path = entry[3:] if len(entry) > 3 else ""
+        if " -> " in path:  # rename/copy: the new path holds the content
+            path = path.split(" -> ", 1)[1]
+        if path:
+            dirty.add(path)
+    return dirty
+
+
+def _snapshot_group_prestate(git_cmd, repo_root) -> Optional[tuple]:
+    """Capture the tree before one group's apply: tracked-dirty paths, the
+    untracked set, and untracked file contents (to restore files the failed
+    group overwrote or deleted). None when git itself errors."""
+    dirty = _tracked_dirty_paths(git_cmd, repo_root)
+    untracked = _untracked_paths(git_cmd, repo_root)
+    if dirty is None or untracked is None:
+        return None
+    contents = {}
+    for path in untracked:
+        full = Path(repo_root) / path
+        try:
+            contents[path] = full.read_bytes() if full.is_file() and not full.is_symlink() else None
+        except OSError:
+            contents[path] = None
+    return (dirty, set(untracked), contents)
+
+
+def _revert_group_apply(git_cmd, repo_root, prestate) -> None:
+    """Surgically revert ONE group's apply, leaving earlier groups intact.
+
+    A whole-tree ``reset --hard`` would also wipe groups that already applied
+    cleanly (and their dropped stashes), turning their ``active`` receipt into
+    a dangling pointer (#130902). Instead only paths this group touched are
+    rolled back: tracked paths it dirtied (reset collapses unmerged stages
+    first, so conflicted applies revert too), untracked files it added, and
+    pre-existing untracked files it overwrote or deleted.
+    """
+    pre_dirty, pre_untracked, pre_contents = prestate
+    current_dirty = _tracked_dirty_paths(git_cmd, repo_root) or set()
+    touched = sorted(current_dirty - pre_dirty)
+    if touched:
+        _git_run(git_cmd, ["reset", "-q", "HEAD", "--", *touched], repo_root)
+        _git_run(git_cmd, ["checkout", "-q", "HEAD", "--", *touched], repo_root)
+    current_untracked = _untracked_paths(git_cmd, repo_root) or set()
+    added = sorted(current_untracked - pre_untracked)
+    if added:
+        _git_run(git_cmd, ["clean", "-fd", "--", *added], repo_root)
+    for path, content in pre_contents.items():
+        if content is None:
+            continue
+        full = Path(repo_root) / path
+        try:
+            if not full.is_file() or full.read_bytes() != content:
+                full.write_bytes(content)
+        except OSError:
+            print(f"! Could not restore pre-apply untracked file {path}.")
+
+
 def _drop_stash(git_cmd, repo_root, stash_sha: str) -> None:
     selector = _stash_ref_for_commit(git_cmd, repo_root, stash_sha)
     if selector is None:
@@ -626,9 +694,13 @@ def restore_preserved_groups(
             outcome[name] = {"status": group.status, "reason": group.reason}
             continue
         untracked_before = _untracked_paths(git_cmd, repo_root) or set()
+        prestate = _snapshot_group_prestate(git_cmd, repo_root)
         ok, detail = _apply_one_stash(git_cmd, repo_root, group.ref)
         if not ok:
-            _reset_after_failed_apply(git_cmd, repo_root, untracked_before)
+            if prestate is None:
+                _reset_after_failed_apply(git_cmd, repo_root, untracked_before)
+            else:
+                _revert_group_apply(git_cmd, repo_root, prestate)
             group.status = "inactive"
             first_line = (detail or "").strip().splitlines()[:1]
             group.reason = (
@@ -639,7 +711,10 @@ def restore_preserved_groups(
             continue
         failure = _validate_restored_tree(repo_root, git_cmd, clean_import_failures)
         if failure is not None:
-            _reset_after_failed_apply(git_cmd, repo_root, untracked_before)
+            if prestate is None:
+                _reset_after_failed_apply(git_cmd, repo_root, untracked_before)
+            else:
+                _revert_group_apply(git_cmd, repo_root, prestate)
             group.status = "inactive"
             group.reason = f"restored tree failed validation ({failure}); recoverable at {group.ref}"
             outcome[name] = {"status": group.status, "reason": group.reason}
