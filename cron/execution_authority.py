@@ -375,6 +375,7 @@ def verify_cron_execution(
         return None
     try:
         from cron.executions import _PROCESS_ID as _CUR_PID2
+        from cron.executions import _owner_is_live
 
         if str(row.get("process_id") or "") != str(_CUR_PID2):
             return None
@@ -383,6 +384,11 @@ def verify_cron_execution(
         if str(row.get("process_id") or "") != str(grant.process_id):
             return None
         if int(row.get("pid")) != int(grant.pid):
+            return None
+        # Ownership is ``(pid, started_at)`` (cron/AGENTS.md): a recycled PID
+        # reuses the numbers but is a different incarnation, so the row's
+        # start-time fingerprint must match the live process.
+        if not _owner_is_live(int(row.get("pid")), row.get("process_started_at")):
             return None
     except Exception:
         return None

@@ -433,6 +433,26 @@ def test_ownership_loss_invalidates(cron_home, monkeypatch):
         assert verify_cron_execution() is None
 
 
+def test_recycled_pid_with_stale_start_fingerprint_invalidates(cron_home):
+    # A recycled PID keeps the process_id/pid numbers but is a different
+    # incarnation; ownership is ``(pid, started_at)`` (cron/AGENTS.md), so a
+    # running row with a stale start-time fingerprint must not verify.
+    current = executions._process_start_time(os.getpid())
+    if current is None:
+        pytest.skip("start-time fingerprint unavailable on this host")
+    row = _running("job-recycled")
+    with scoped_execution_grant(row["id"]):
+        assert verify_cron_execution() is not None
+        # Same process_id/pid, but the row names an older incarnation.
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET process_started_at=? WHERE id=?",
+                (current - 10000, row["id"]),
+            )
+        assert executions._owner_is_live(os.getpid(), current - 10000) is False
+        assert verify_cron_execution() is None
+
+
 def test_generation_change_invalidates(cron_home):
     row = _running("job-generation")
     with scoped_execution_grant(row["id"]):
