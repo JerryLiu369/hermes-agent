@@ -639,7 +639,13 @@ def test_launch_external_worker_pin_extends_the_sanitized_env_not_os_environ(
 
     assert scheduler._launch_external_cron_worker(job) is True
     entries = spawned[0][1]["env"]["PYTHONPATH"].split(os.pathsep)
-    assert entries == [str(repo_root), str(tmp_path / "kept-by-sanitizer")]
+    # The runtime site-packages pin is environment-dependent: on a checkout
+    # with a venv/.venv (CI creates .venv via `uv sync --locked`) the helpers
+    # resolve a real third entry between the repo root and the sanitizer-kept
+    # tail. Assert the load-bearing shape, not an exact two-entry list.
+    assert entries[0] == str(repo_root)
+    assert entries[-1] == str(tmp_path / "kept-by-sanitizer")
+    assert len(entries) in (2, 3)
 
     # Wheel / pipx layout: repo_root == purelib -> untouched.
     monkeypatch.setattr(worker_env_mod, "_installed_purelib", lambda: repo_root)

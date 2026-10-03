@@ -77,3 +77,45 @@ def test_pin_hermes_tree_on_pythonpath_deduplicates(tmp_path):
 
 def test_runtime_site_packages_resolution_missing(tmp_path):
     assert swe._runtime_site_packages(tmp_path / "nonexistent") is None
+
+
+def test_runtime_site_packages_resolves_facts_json_generation(tmp_path, monkeypatch):
+    """Exercise the real facts.json -> selected_venv -> site_packages branch.
+
+    A facts.json naming a generation under <install_state>/environments/<gen>/
+    (with pyvenv.cfg at its root) must resolve to that generation's
+    site-packages, and the pin must carry it — no _runtime_site_packages patch.
+    """
+    import json
+
+    from pm.environments import install_state_dir, site_packages
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_RUNTIME_DIR", raising=False)
+
+    generation = install_state_dir(repo_root) / "environments" / "gen1"
+    (generation / "pyvenv.cfg").parent.mkdir(parents=True, exist_ok=True)
+    (generation / "pyvenv.cfg").write_text(
+        "home = /usr/bin\nversion = 3.14.0\n", encoding="utf-8"
+    )
+    expected_sp = site_packages(generation)
+    expected_sp.mkdir(parents=True, exist_ok=True)
+
+    facts_path = install_state_dir(repo_root) / "facts.json"
+    facts_path.parent.mkdir(parents=True, exist_ok=True)
+    facts_path.write_text(
+        json.dumps({"packages": {"venv": {"environment": str(generation)}}}),
+        encoding="utf-8",
+    )
+
+    assert swe._runtime_site_packages(repo_root) == expected_sp.resolve()
+
+    env = {"PYTHONPATH": "/user/custom"}
+    result = swe.pin_hermes_tree_on_pythonpath(dict(env), repo_root)
+    assert result["PYTHONPATH"] == os.pathsep.join(
+        [str(repo_root), str(expected_sp.resolve()), "/user/custom"]
+    )
