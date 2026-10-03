@@ -168,6 +168,45 @@ def _install_disk_space_preflight(
     return report
 
 
+def _live_table_row_counts(conn) -> dict[str, int]:
+    """User-table row counts on a live connection (sqlite internals excluded)."""
+    names = [
+        row[0] for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+        ).fetchall()
+    ]
+    counts = {}
+    for name in names:
+        try:
+            counts[name] = int(conn.execute(f'SELECT COUNT(*) FROM "{name}"').fetchone()[0])
+        except Exception:
+            continue  # unreadable under corruption: recovery already refused or salvaged it
+    return counts
+
+
+def _nonempty_tables_missing_from_candidate(live_conn, candidate_path: Path) -> dict[str, int]:
+    """Live tables the recovered candidate does not carry, with their row counts.
+
+    Installation replaces the whole file, so a live-only table with rows would
+    vanish on an exit-0 install. The candidate only copies recovery-known
+    tables; anything else (a lazily created gateway table recovery never
+    registered, a newer-schema table) must block the install, not be dropped.
+    """
+    candidate_conn = sqlite3.connect(str(candidate_path))
+    try:
+        candidate_tables = {
+            row[0] for row in candidate_conn.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            ).fetchall()
+        }
+    finally:
+        candidate_conn.close()
+    return {
+        name: rows for name, rows in _live_table_row_counts(live_conn).items()
+        if name not in candidate_tables and rows > 0
+    }
+
+
 def _path_signature(db_path: Path) -> dict[str, dict[str, int]]:
     """Fingerprint the durable database files, ignoring regenerable SHM and empty journals.
 
@@ -177,6 +216,10 @@ def _path_signature(db_path: Path) -> dict[str, dict[str, int]]:
     signature: dict[str, dict[str, int]] = {}
     for suffix in _INSTALL_SIDECARS:
         if suffix in _VOLATILE_SIDECARS:
+            # -shm is process-volatile WAL peer state with no durable content, and the
+            # exclusive guard itself creates/drops it while taking ownership — fingerprinting
+            # it would flag a generation change the install did to itself. Do not "simplify"
+            # this exclusion away.
             continue
         path = Path(f"{db_path}{suffix}") if suffix else db_path
         try:
@@ -461,6 +504,18 @@ def recover_and_install_session_database(
                 )
                 return report
             journal_mode = guard.execute("PRAGMA journal_mode").fetchone()[0]
+            unknown_live = _nonempty_tables_missing_from_candidate(guard, output)
+            if unknown_live:
+                names = ", ".join(f"{name} ({rows} rows)" for name, rows in sorted(unknown_live.items()))
+                report["promoted"] = False
+                report["verification"]["unknown_live_tables"] = sorted(unknown_live)
+                report["install_refusal"] = (
+                    f"The live database holds tables the recovered candidate does not carry: {names}. "
+                    "Installing would silently drop them. Register the owning tables in "
+                    "hermes_cli/session_recovery.py (_AUXILIARY_TABLE_SCHEMAS) or back them up separately, "
+                    "then retry. The active database was not replaced."
+                )
+                return report
             _copy_database_snapshot(output, source, destination_connection=guard)
             promoted = True
             _restore_journal_mode_after_repair(source, journal_mode, conn=guard)

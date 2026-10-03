@@ -13,6 +13,8 @@ from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 from hermes_state import SessionDB
 
 
@@ -44,8 +46,13 @@ def _corrupt_fts_data_root(path: Path) -> None:
         handle.write(b"\xde\xad\xbe\xef" * (page_size // 4))
 
 
+@pytest.mark.requires_wal
 def test_install_recovers_real_corruption_under_quiescent_writer_guard(tmp_path, monkeypatch, capsys):
-    """A complete candidate is installed only through the real exclusive DB guard."""
+    """A complete candidate is installed only through the real exclusive DB guard.
+
+    Requires WAL: the generation fingerprint asserts on the -wal sidecar, which only
+    exists while the store actually runs in WAL journal mode.
+    """
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -394,3 +401,51 @@ def test_install_refuses_against_a_separate_process_holding_the_db(tmp_path, mon
         except Exception:
             holder.kill()
             holder.wait(timeout=10)
+
+
+def test_install_refuses_when_live_holds_tables_the_candidate_lacks(tmp_path, monkeypatch, capsys):
+    """A live-only table with rows blocks --install instead of being silently dropped.
+
+    Recovery copies only known tables into the candidate; installing that candidate
+    over the live file would erase anything else. A table recovery never registered
+    (here standing in for agent_config_overrides / agent_tool_state) must refuse
+    with its name in the refusal, and the live rows must survive.
+    """
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    source = home / "state.db"
+    output = tmp_path / "must-not-install.db"
+    report_path = output.with_name(output.name + ".recovery.json")
+    _seed_state_db(source)
+    _corrupt_fts_data_root(source)
+    # NOTE: plain sqlite3.connect (closed explicitly) — `with conn:` would only
+    # scope the transaction, leaving the handle open and tripping the live-writer guard.
+    conn = sqlite3.connect(str(source))
+    try:
+        conn.execute("CREATE TABLE agent_config_overrides (scope TEXT PRIMARY KEY, payload TEXT)")
+        conn.execute("INSERT INTO agent_config_overrides VALUES ('profile', '{\"ttl\": 60}')")
+        conn.commit()
+    finally:
+        conn.close()
+
+    from hermes_cli.sessions_cmd import _cmd_recover
+
+    status = _cmd_recover(Namespace(
+        source=source,
+        output=output,
+        inspect_only=False,
+        allow_partial=False,
+        install=True,
+        report=report_path,
+        work_dir=tmp_path,
+        chunk_size=1000,
+    ))
+
+    assert status != 0
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["installed"] is False
+    assert "agent_config_overrides" in report["install_refusal"]
+    assert "agent_config_overrides" in report["verification"]["unknown_live_tables"]
+    with sqlite3.connect(str(source)) as check:
+        assert check.execute("SELECT COUNT(*) FROM agent_config_overrides").fetchone()[0] == 1
