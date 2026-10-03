@@ -285,3 +285,34 @@ def test_drained_queued_turn_keeps_client_turn_id(monkeypatch):
     session["running"] = False
     assert server._drain_queued_prompt("drain-b", "sid", session) is True
     assert dispatched and dispatched[0][3].get("client_turn_id") == "turn-5"
+
+
+def test_queued_retry_of_same_turn_id_does_not_merge_a_duplicate(monkeypatch):
+    """Idempotent retry in the accept→start window: the same id while its turn
+    is still queued answers the queued status instead of text-merging a second
+    copy into the envelope (#130947)."""
+    monkeypatch.setattr(
+        server, "_ensure_active_session_slot", lambda sid, session: None
+    )
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "queue")
+    session = _session(running=True)
+    session["inflight_turn"] = {
+        "user": "live turn",
+        "assistant": "",
+        "streaming": True,
+        "client_turn_id": "turn-live",
+    }
+    session["queued_prompt"] = {"text": "hello", "client_turn_id": "turn-1"}
+    server._sessions["sid-130947"] = session
+    try:
+        resp = server._methods["prompt.submit"](
+            "r1",
+            {"session_id": "sid-130947", "text": "hello", "client_turn_id": "turn-1"},
+        )
+    finally:
+        server._sessions.pop("sid-130947", None)
+
+    assert resp["result"] == {"status": "queued", "client_turn_id": "turn-1"}
+    assert session["queued_prompt"]["text"] == "hello", (
+        "the retry must not text-merge a duplicate into the envelope")
+    PromptSubmitResult.model_validate(resp["result"])

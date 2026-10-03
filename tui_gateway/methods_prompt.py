@@ -760,6 +760,15 @@ def _(rid, params: dict) -> dict:
                 if isinstance(inflight, dict) and inflight.get("client_turn_id") == client_turn_id:
                     result: dict = {"status": "streaming", "client_turn_id": client_turn_id}
                     return _ok(rid, result)
+                # Same id still queued (accept→start window, or a compression-
+                # demoted steer): answer the queued status instead of merging a
+                # duplicate into the envelope (#130947). Covers the single slot
+                # and the overflow list.
+                queued_all = [session.get("queued_prompt"), *(session.get("queued_prompts") or [])]
+                for queued in queued_all:
+                    if isinstance(queued, dict) and queued.get("client_turn_id") == client_turn_id:
+                        result = {"status": "queued", "client_turn_id": client_turn_id}
+                        return _ok(rid, result)
             busy_transport = t or session.get("transport")
         if has_truncation:
             # A rewind/edit/restore/regenerate must land as a truncation, never as a
