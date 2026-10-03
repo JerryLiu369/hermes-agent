@@ -56,6 +56,24 @@ export function classifyAttachedProbeError(error: unknown): AttachedProbeFailure
     return 'hard'
   }
 
+  // Credentialed probes arrive wrapped: backend-health's makeReauthRequiredError
+  // replaces the message with the reauth prompt, the 401/403 surviving only in
+  // `.detail` plus the reauth flags. Matching the message alone classifies a
+  // rejected session as transient and retries a dead token to the threshold.
+  const flagged = error as {
+    detail?: unknown
+    isReauthRequired?: unknown
+    needsOauthLogin?: unknown
+  } | null
+  if (flagged !== null && typeof flagged === 'object') {
+    if (flagged.isReauthRequired === true || flagged.needsOauthLogin === true) {
+      return 'hard'
+    }
+    if (typeof flagged.detail === 'string' && isAuthRejectionMessage(flagged.detail)) {
+      return 'hard'
+    }
+  }
+
   return 'transient'
 }
 

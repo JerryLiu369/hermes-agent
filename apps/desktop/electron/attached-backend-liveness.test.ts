@@ -59,6 +59,27 @@ test('credentialed auth rejections classify as hard', () => {
   assert.equal(classifyAttachedProbeError(new Error('403: forbidden')), 'hard')
 })
 
+test('wrapped reauth errors classify as hard, not transient', () => {
+  // The credentialed-probe shape: backend-health's makeReauthRequiredError
+  // replaces the message, the 401 surviving only in .detail + reauth flags.
+  const wrapped = Object.assign(
+    new Error('Your remote gateway session has expired. Open Settings → Gateway and click "Sign in" again.'),
+    { needsOauthLogin: true, isReauthRequired: true, detail: '401: no_cookie' }
+  )
+  assert.equal(classifyAttachedProbeError(wrapped), 'hard')
+
+  // Flags alone are enough even when the detail is missing.
+  const flagsOnly = Object.assign(new Error('session expired'), { isReauthRequired: true })
+  assert.equal(classifyAttachedProbeError(flagsOnly), 'hard')
+
+  // A bare 401 in .detail with no flags is still an auth rejection.
+  const detailOnly = Object.assign(new Error('probe failed'), { detail: '403: forbidden' })
+  assert.equal(classifyAttachedProbeError(detailOnly), 'hard')
+
+  // ...but an unflagged session-expiry-looking message stays transient.
+  assert.equal(classifyAttachedProbeError(new Error('session expired, retrying')), 'transient')
+})
+
 test('timeout detection covers TimeoutError shapes and ETIMEDOUT codes', () => {
   assert.equal(isTimeoutLikeError(new Error('Timed out connecting to Hermes backend after 5000ms')), true)
   assert.equal(isTimeoutLikeError(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })), true)
