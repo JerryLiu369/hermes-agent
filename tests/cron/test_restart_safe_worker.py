@@ -684,7 +684,7 @@ def test_launch_external_worker_pin_extends_the_sanitized_env_not_os_environ(
         worker_env_mod, "_committed_dependency_site_packages", lambda _root: None
     )
     monkeypatch.setattr(
-        worker_env_mod, "_active_runtime_site_packages", lambda: [fallback]
+        worker_env_mod, "_active_runtime_site_packages", lambda *a, **k: [fallback]
     )
     spawned, _payloads, _handoff, _get = _stub_external_worker_launch(scheduler, monkeypatch)
     repo_root = Path(scheduler.__file__).resolve().parent.parent
@@ -754,14 +754,14 @@ def test_pin_restores_the_committed_generation_site_packages(tmp_path, monkeypat
     fallback_dir = tmp_path / "fallback-site-packages"
     fallback_dir.mkdir()
     monkeypatch.setattr(
-        worker_env_mod, "_active_runtime_site_packages", lambda: [fallback_dir]
+        worker_env_mod, "_active_runtime_site_packages", lambda *a, **k: [fallback_dir]
     )
     assert worker_env_mod.pin_hermes_tree_on_pythonpath({}, repo_root) == {
         "PYTHONPATH": os.pathsep.join([str(repo_root), str(fallback_dir)])
     }
 
     # Neither committed nor active: tree only, nothing invented.
-    monkeypatch.setattr(worker_env_mod, "_active_runtime_site_packages", lambda: [])
+    monkeypatch.setattr(worker_env_mod, "_active_runtime_site_packages", lambda *a, **k: [])
     assert worker_env_mod.pin_hermes_tree_on_pythonpath({}, repo_root) == {
         "PYTHONPATH": str(repo_root)
     }
@@ -1226,3 +1226,126 @@ def test_post_handoff_waiter_failure_records_bookkeeping_without_alert(
     assert len(marks) == 1 and marks[0][0][1] is False
     assert marks[0][0][2].startswith("Restart-safe cron worker failed after handoff: ")
     assert execution_ledger.get_execution(record["id"])["status"] == "failed"
+
+
+def _isolate_active_runtime_sources(monkeypatch, tmp_path, repo):
+    """Leave only the VIRTUAL_ENV source: empty sys.path entries, dead sys.prefix,
+    no PM facts, and repo-root aliases reduced to ``repo``."""
+    import sys
+
+    import pm.environments as pm_env
+    import tools.environments.local as local_mod
+
+    monkeypatch.setattr(sys, "path", [], raising=False)
+    monkeypatch.setattr(sys, "prefix", str(tmp_path / "no-prefix"), raising=False)
+    monkeypatch.setattr(
+        pm_env, "runtime_facts_path", lambda _root: tmp_path / "no-facts.json"
+    )
+    monkeypatch.setattr(local_mod, "_hermes_repo_root_aliases", (repo,))
+
+
+def _make_validated_venv(repo: Path) -> tuple[Path, Path]:
+    """Create ``<repo>/venv`` with a real ``pyvenv.cfg`` and its site-packages dir;
+    return ``(venv, site-packages)`` using PM's own layout (version from this interpreter)."""
+    import sys
+
+    import pm.environments as pm_env
+
+    version = f"{sys.version_info[0]}.{sys.version_info[1]}"
+    venv = repo / "venv"
+    venv.mkdir(parents=True, exist_ok=True)
+    (venv / "pyvenv.cfg").write_text(f"version = {version}\n", encoding="utf-8")
+    selected = pm_env.site_packages(venv)
+    selected.mkdir(parents=True, exist_ok=True)
+    return venv, selected
+
+
+def test_active_runtime_site_packages_gates_virtual_env(tmp_path, monkeypatch):
+    """#130269 review: ``VIRTUAL_ENV`` alone is not provenance. Only the validated
+    ``<repo>/venv`` (spelling + real ``pyvenv.cfg``) contributes; a foreign tree —
+    even with an existing same-version ``site-packages`` — a missing ``pyvenv.cfg``,
+    or a wrong-version tree contributes nothing."""
+    import sys
+
+    import cron.scheduler_worker_env as worker_env_mod
+    import pm.environments as pm_env
+
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _isolate_active_runtime_sources(monkeypatch, tmp_path, repo)
+    venv, expected_sp = _make_validated_venv(repo)
+
+    # Validated repo venv is accepted.
+    result = worker_env_mod._active_runtime_site_packages({"VIRTUAL_ENV": str(venv)})
+    assert str(expected_sp) in [str(p) for p in result]
+
+    # Same spelling without pyvenv.cfg is rejected.
+    (venv / "pyvenv.cfg").unlink()
+    assert worker_env_mod._active_runtime_site_packages({"VIRTUAL_ENV": str(venv)}) == []
+    version = f"{sys.version_info[0]}.{sys.version_info[1]}"
+    (venv / "pyvenv.cfg").write_text(f"version = {version}\n", encoding="utf-8")
+
+    # Foreign venv with a real pyvenv.cfg and an existing same-version tree is
+    # still rejected: provenance, not mere existence.
+    foreign = tmp_path / "foreign-venv"
+    foreign_sp = foreign / "lib" / f"python{version}" / "site-packages"
+    foreign_sp.mkdir(parents=True)
+    (foreign / "pyvenv.cfg").write_text(f"version = {version}\n", encoding="utf-8")
+    assert worker_env_mod._active_runtime_site_packages({"VIRTUAL_ENV": str(foreign)}) == []
+
+    # Foreign tree without pyvenv.cfg is rejected (the old code accepted it on
+    # ``is_dir`` alone).
+    foreign_bare = tmp_path / "foreign-bare"
+    (foreign_bare / "lib" / f"python{version}" / "site-packages").mkdir(parents=True)
+    assert (
+        worker_env_mod._active_runtime_site_packages({"VIRTUAL_ENV": str(foreign_bare)})
+        == []
+    )
+
+    # Wrong-version foreign tree is rejected as foreign, not coincidentally.
+    wrong = "python3.7" if version != "3.7" else "python3.8"
+    foreign_wrong = tmp_path / "foreign-wrong"
+    (foreign_wrong / "lib" / wrong / "site-packages").mkdir(parents=True)
+    assert (
+        worker_env_mod._active_runtime_site_packages({"VIRTUAL_ENV": str(foreign_wrong)})
+        == []
+    )
+    _ = pm_env  # keep import used if layout helpers change
+
+
+def test_active_runtime_site_packages_reads_worker_env_not_os_environ(
+    tmp_path, monkeypatch
+):
+    """#130269 review: the marker is read from the worker env — the only env the
+    caller has — never ``os.environ``, which can describe the invoking shell's Python."""
+    import cron.scheduler_worker_env as worker_env_mod
+
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    repo = tmp_path / "repo2"
+    repo.mkdir()
+    _isolate_active_runtime_sources(monkeypatch, tmp_path, repo)
+    venv, expected_sp = _make_validated_venv(repo)
+
+    # Marker only in os.environ is ignored.
+    monkeypatch.setenv("VIRTUAL_ENV", str(venv))
+    assert worker_env_mod._active_runtime_site_packages({}) == []
+    assert worker_env_mod._active_runtime_site_packages(None) == []
+
+    # Same marker carried by the worker env is honoured.
+    result = worker_env_mod._active_runtime_site_packages({"VIRTUAL_ENV": str(venv)})
+    assert str(expected_sp) in [str(p) for p in result]
+
+    # The pin threads the worker env through: a foreign os.environ marker never leaks in.
+    monkeypatch.setattr(
+        worker_env_mod, "_committed_dependency_site_packages", lambda _root: None
+    )
+    foreign = tmp_path / "foreign-env"
+    foreign.mkdir()
+    monkeypatch.setenv("VIRTUAL_ENV", str(foreign))
+    pinned = worker_env_mod.pin_hermes_tree_on_pythonpath({}, repo)
+    assert pinned["PYTHONPATH"].split(os.pathsep) == [str(repo)]
+    pinned_with = worker_env_mod.pin_hermes_tree_on_pythonpath(
+        {"VIRTUAL_ENV": str(venv)}, repo
+    )
+    assert str(expected_sp) in pinned_with["PYTHONPATH"].split(os.pathsep)

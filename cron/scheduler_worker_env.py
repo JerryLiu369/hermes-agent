@@ -50,8 +50,8 @@ def _committed_dependency_site_packages(project_root: Path) -> Path | None:
 
         environment = committed_venv(project_root)
     except Exception as exc:
-        # An unreadable record: pin the tree only. The cron worker's own boot re-reads it and
-        # fails the dispatch with PM's error.
+        # An unreadable record: let the caller fall back to the active runtime.
+        # The cron worker's own boot re-reads it and fails the dispatch with PM's error.
         logger.warning(
             "cron worker: could not read the committed dependency environment: %s", exc
         )
@@ -62,7 +62,7 @@ def _committed_dependency_site_packages(project_root: Path) -> Path | None:
     return selected if selected.is_dir() else None
 
 
-def _active_runtime_site_packages() -> list[Path]:
+def _active_runtime_site_packages(worker_env: dict | None = None) -> list[Path]:
     """Site-packages dirs this process actually imports from, in priority order.
 
     Fallback when PM has no committed generation for the checkout (non-PM installs,
@@ -76,8 +76,12 @@ def _active_runtime_site_packages() -> list[Path]:
        provenance.
     2. The ``sys.prefix``-derived site-packages (covers ``-S``/isolated launches
        where ``site`` never added it to ``sys.path``).
-    3. ``VIRTUAL_ENV``-derived site-packages when it names a different, existing
-       tree (a venv-activated gateway whose markers the sanitizer stripped).
+    3. The validated runtime venv's site-packages (``tools.environments
+       .local_pythonpath._validated_runtime_venv`` applied to the worker env's own
+       ``VIRTUAL_ENV``): the legacy ``<repo>/venv`` layout AND a real ``pyvenv.cfg``,
+       never an unrelated venv. Read from ``worker_env``, never ``os.environ`` — the
+       sanitizer already popped the marker from the child env, and ``os.environ`` can
+       describe the invoking shell's Python (``pm/environments.py``).
 
     Empty when nothing usable exists — the caller then pins the tree only and
     invents nothing.
@@ -117,14 +121,18 @@ def _active_runtime_site_packages() -> list[Path]:
     except (OSError, ValueError):
         pass
 
-    venv = os.environ.get("VIRTUAL_ENV")
-    if venv:
+    env = worker_env if worker_env is not None else {}
+    try:
+        from tools.environments.local_pythonpath import _validated_runtime_venv
+
+        from pm.environments import site_packages as _validated_site_packages
+
+        validated = _validated_runtime_venv(env)
+    except Exception:
+        validated = None
+    if validated is not None:
         try:
-            venv_path = Path(venv)
-            if os.name == "nt":
-                _append(venv_path / "Lib" / "site-packages")
-            else:
-                _append(venv_path / "lib" / pyver / "site-packages")
+            _append(_validated_site_packages(validated))
         except (OSError, ValueError):
             pass
 
@@ -154,7 +162,7 @@ def pin_hermes_tree_on_pythonpath(worker_env: dict, repo_root: Path) -> dict:
     if dependency is not None:
         dependencies = [str(dependency)]
     else:
-        dependencies = [str(p) for p in _active_runtime_site_packages()]
+        dependencies = [str(p) for p in _active_runtime_site_packages(worker_env)]
     pinned = [root, *dependencies]
     worker_env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys([*pinned, *existing]))
     return worker_env
