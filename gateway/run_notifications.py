@@ -943,7 +943,50 @@ class GatewayNotificationsMixin:
         return t("gateway.startup.free_tier_line")
 
     _planned_restart_notice_lock: Optional[asyncio.Lock] = None
+    # A planned-restart marker names home channels that may not be reachable at boot. Nothing else
+    # bounds that wait, so a platform that never comes back would keep the marker on disk and re-log
+    # on every replay. Expire only the UNDELIVERED RESIDUE past this age — a reachable home is always
+    # attempted first — mirroring ``_UPDATE_NOTIFY_MAX_ADAPTER_WAIT_SECONDS``.
     _MAX_PLANNED_RESTART_NOTICE_AGE_SECS: float = 3600.0  # 1 hour
+
+    def _owed_home_channel_targets(self) -> set[tuple[str, str, Optional[str]]]:
+        """Notice keys owed a planned-restart notice: every served profile's enabled, opted-in home
+        channel.
+
+        Config-derived, not transport-derived, so a removed home or an opt-out
+        (``gateway_restart_notification=false``) cannot keep the marker alive forever.
+        """
+        return {
+            _served_notice_target_key(
+                profile, platform.value, cfg.home_channel.chat_id, cfg.home_channel.thread_id)
+            for profile, platform, cfg in self._served_home_channel_configs()
+            if cfg.enabled and cfg.home_channel and cfg.home_channel.chat_id and cfg.gateway_restart_notification
+        }
+
+    def _reachable_home_channel_targets(self) -> set[tuple[str, str, Optional[str]]]:
+        """Notice keys of every served home channel with a live transport right now."""
+        return {
+            _served_notice_target_key(profile, platform.value, home.chat_id, home.thread_id)
+            for profile, platform, _cfg, home, _transport in self._served_home_channel_transports()
+        }
+
+    def _planned_restart_marker_expired(self, data: dict) -> bool:
+        """True once the marker outlived ``_MAX_PLANNED_RESTART_NOTICE_AGE_SECS`` (numeric stamp only)."""
+        requested_at = data.get("requested_at")
+        return (
+            isinstance(requested_at, (int, float))
+            and time.time() - requested_at > self._MAX_PLANNED_RESTART_NOTICE_AGE_SECS
+        )
+
+    def _planned_restart_marker_is_dischargeable(self, data: dict) -> bool:
+        """True when a ``.restart_pending.json`` marker owes no further notice, so it is safe to discard.
+
+        Either every owed target is already recorded delivered, or the marker aged out. A fresh,
+        fully-undelivered obligation returns False: a non-restart stop must not erase it (#127316
+        follow-up), and the age bound from finding 1 will eventually discharge an unreachable one.
+        """
+        delivered = {tuple(target) for target in data.get("delivered_targets", [])}
+        return self._planned_restart_marker_expired(data) or self._owed_home_channel_targets() <= delivered
 
     async def _replay_pending_planned_restart_notification(self) -> None:
         """Send the planned-restart online notice to every home channel still owed one; clear
@@ -954,6 +997,12 @@ class GatewayNotificationsMixin:
         targets are recorded in the marker so neither a later replay nor the next process (if this
         one restarts first) notifies a home twice. The lock serializes a boot pass that outlived the
         restore gate against a concurrent reconnect replay.
+
+        The age bound expires only the UNDELIVERED RESIDUE — a target that never reconnected — never
+        the whole marker: a reachable home is attempted first, so an aged marker still notifies a
+        healthy channel instead of being silently discarded (#127316 follow-up). Mirrors
+        ``_UPDATE_NOTIFY_MAX_ADAPTER_WAIT_SECONDS``: expiry is armed only after the adapter failed to
+        come back, and gives up with a WARNING.
         """
         from gateway.run import _planned_restart_notification_path
         from utils import atomic_json_write
@@ -966,29 +1015,25 @@ class GatewayNotificationsMixin:
                 return
             try:
                 data = json.loads(path.read_text(encoding="utf-8-sig"))
-                requested_at = data.get("requested_at")
-                if (
-                    isinstance(requested_at, (int, float))
-                    and time.time() - requested_at > self._MAX_PLANNED_RESTART_NOTICE_AGE_SECS
-                ):
-                    logger.info(
-                        "Ignoring and clearing expired planned-restart notification marker (age=%.0fs > %.0fs)",
-                        time.time() - requested_at,
-                        self._MAX_PLANNED_RESTART_NOTICE_AGE_SECS,
-                    )
+                delivered = {tuple(target) for target in data.get("delivered_targets", [])}
+                owed = self._owed_home_channel_targets()
+                delivered |= await self._send_home_channel_startup_notifications(skip_targets=delivered)
+                undelivered = owed - delivered
+                if not undelivered:
                     path.unlink(missing_ok=True)
                     return
-                delivered = {tuple(target) for target in data.get("delivered_targets", [])}
-                # Owed targets come from config, not live transports: a removed home or an opt-out
-                # (gateway_restart_notification=false) must not keep the marker alive forever.
-                owed = {
-                    _served_notice_target_key(
-                        profile, platform.value, cfg.home_channel.chat_id, cfg.home_channel.thread_id)
-                    for profile, platform, cfg in self._served_home_channel_configs()
-                    if cfg.enabled and cfg.home_channel and cfg.home_channel.chat_id and cfg.gateway_restart_notification
-                }
-                delivered |= await self._send_home_channel_startup_notifications(skip_targets=delivered)
-                if owed <= delivered:
+                # Every reachable target was attempted above. Expire only a residue whose adapters
+                # never reconnected; a target with a live transport that merely failed its send stays
+                # owed for the next replay.
+                if (
+                    self._planned_restart_marker_expired(data)
+                    and undelivered <= (owed - self._reachable_home_channel_targets())
+                ):
+                    logger.warning(
+                        "Planned-restart notification expired after %.1fh: dropped %d owed home-channel "
+                        "target(s) whose adapters never reconnected",
+                        (time.time() - float(data["requested_at"])) / 3600.0, len(undelivered),
+                    )
                     path.unlink(missing_ok=True)
                     return
                 data["delivered_targets"] = [list(target) for target in delivered]
