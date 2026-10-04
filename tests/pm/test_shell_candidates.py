@@ -66,9 +66,9 @@ def test_windows_app_alias_rejects_non_windowsapps_paths(path):
 
 @pytest.mark.parametrize(
     "path",
-    [r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\python.exe",
-     r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\python3.exe",
-     "C:/Users/u/AppData/Local/Microsoft/WindowsApps/python3.11.exe"],
+    [r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\python3.exe",
+     "C:/Users/u/AppData/Local/Microsoft/WindowsApps/python3.11.exe",
+     r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\pythonw3.exe"],
 )
 def test_python_store_alias_matches_python_stubs(path):
     assert is_windows_python_store_alias(path) is True
@@ -77,6 +77,11 @@ def test_python_store_alias_matches_python_stubs(path):
 @pytest.mark.parametrize(
     "path",
     [r"C:\Python311\python.exe", r"C:\Python311\python3.exe",
+     # A properly Store-installed Python legitimately lives at
+     # WindowsApps\python.exe (App Execution Alias backed by a real
+     # interpreter) — only the python3 family is an always-stub (#129156).
+     r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\python.exe",
+     r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\pythonw.exe",
      r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\bash.exe",
      r"C:\Users\u\AppData\Local\Microsoft\WindowsApps\pip.exe"],
 )

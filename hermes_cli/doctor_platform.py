@@ -429,9 +429,12 @@ def _staged_venv_dir() -> "Path | None":
 
 def _windows_store_alias_pythons(which_fn=None) -> list[str]:
     """Names among (``python``, ``python3``) whose PATH resolution is a
-    Microsoft Store App Execution Alias stub (see #129102). Pure PATH
-    classification via :func:`pm.shell.is_windows_python_store_alias` —
-    host-independent so tests can run anywhere.
+    Microsoft Store App Execution Alias stub (see #129102). Only the
+    ``python3`` family is flagged: a Store-installed Python legitimately
+    lives at ``...\\WindowsApps\\python.exe``, so ``python.exe`` there is
+    never classified as a stub by path alone. Pure PATH classification via
+    :func:`pm.shell.is_windows_python_store_alias` — host-independent so
+    tests can run anywhere.
     """
     from pm.shell import is_windows_python_store_alias
 
@@ -448,19 +451,23 @@ def _windows_store_alias_pythons(which_fn=None) -> list[str]:
 
 
 def _check_windows_python_store_alias(f: Finding) -> None:
-    """Warn when ``python``/``python3`` on PATH are Store alias stubs, not a
-    real interpreter (running one prints "Python was not found..." and exits
-    9009). See #129102."""
+    """Warn when ``python3`` on PATH is a Store alias stub with no
+    interpreter behind it (running it prints "Python was not found..." and
+    exits 9009). ``python.exe`` under WindowsApps is deliberately not
+    flagged: a properly Store-installed Python legitimately lives there.
+    See #129102."""
     with warn_on_error("Windows Store Python alias check failed: {e}", ""):
         aliases = _windows_store_alias_pythons()
     if not aliases:
         return
     names = "/".join(f"`{name}`" for name in aliases)
-    verb = "is a Microsoft Store alias" if len(aliases) == 1 else "are Microsoft Store aliases"
-    check_warn(f"no real Python on PATH; {names} {verb}",
-               "(install Python from python.org or the Microsoft Store; the WindowsApps alias only opens the Store)")
+    verb = "is a Microsoft Store alias stub" if len(aliases) == 1 else "are Microsoft Store alias stubs"
+    check_warn(f"{names} on PATH {verb}",
+               "(the `python3.exe` App Execution Alias under WindowsApps has no interpreter behind it;"
+               " use `python` instead — a Store-installed Python legitimately lives at WindowsApps\\python.exe"
+               " — or install Python from python.org or the Microsoft Store)")
     f.manual_issues.append(
-        f"Install a real Python: {names} on PATH {verb} with no interpreter behind it")
+        f"{names} on PATH {verb} with no interpreter behind it (use `python` instead)")
 
 
 @doctor_check()

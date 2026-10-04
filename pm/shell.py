@@ -60,12 +60,6 @@ def _staged_bash() -> str | None:
     return None
 
 
-# PATH dirs whose bash.exe is not a shell: System32 holds the WSL launcher
-# stub (prints "no installed distributions", exits 1) and WindowsApps holds
-# MSIX execution aliases that fail with WinError 5 from an arbitrary process.
-_WINDOWS_BASH_STUB_DIRS = ("system32", "windowsapps")
-
-
 def is_windows_app_alias(path: str | os.PathLike) -> bool:
     """Whether *path* lives under a WindowsApps App Execution Alias directory.
 
@@ -84,13 +78,14 @@ def is_windows_app_alias(path: str | os.PathLike) -> bool:
 
 
 def is_windows_python_store_alias(path: str | os.PathLike) -> bool:
-    """Whether *path* is a ``python``/``python3`` Microsoft Store launcher stub.
+    """Whether *path* is a ``python3`` Microsoft Store launcher stub.
 
-    The Store Python ships ``python.exe`` only, so ``python3.exe`` under
-    WindowsApps is always a stub; ``python.exe`` there is a stub when no real
-    Store Python is installed (running it prints "Python was not found..."
-    and exits 9009). Matches versioned ``python3.x.exe`` spellings too.
-    See #129102.
+    Only the ``python3`` family is flagged: a properly Store-installed
+    Python legitimately lives at ``...\\WindowsApps\\python.exe`` (App
+    Execution Alias backed by a real interpreter), so ``python.exe`` there
+    must not warn by path alone. ``python3.exe`` under WindowsApps is the
+    documented always-stub POSIX-compat alias. Matches versioned
+    ``python3.x.exe`` spellings too. See #129102.
     """
     if not is_windows_app_alias(path):
         return False
@@ -101,7 +96,7 @@ def is_windows_python_store_alias(path: str | os.PathLike) -> bool:
     if not isinstance(raw, str) or not raw:
         return False
     base = raw.lower().replace("/", "\\").rsplit("\\", 1)[-1]
-    return re.fullmatch(r"pythonw?(\d+(\.\d+)*)?\.exe", base) is not None
+    return re.fullmatch(r"pythonw?3\d*(\.\d+)*\.exe", base) is not None
 
 
 def windows_bash_candidates(on_path: str | None, env: Mapping[str, str]) -> list[str]:
