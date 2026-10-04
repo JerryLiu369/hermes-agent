@@ -475,9 +475,7 @@ def published_env() -> Dict[str, str]:
     marker = sandbox_host._read_marker()
     if marker:
         env = _sandbox_env(create=False)
-        if env is not None and sandbox_host._owner_identity(env) == {
-            key: marker[key] for key in sandbox_host._owner_identity(env) if key in marker
-        }:
+        if sandbox_host.marker_owned_by_env(marker, env):
             return sandbox_host.published_env(env, _profile_name())
     if _launcher_pid() is None:
         return {}
@@ -499,9 +497,7 @@ def rfb_socket_path() -> Optional[Path]:
     marker = sandbox_host._read_marker()
     if marker:
         env = _sandbox_env(create=False)
-        if env is not None and sandbox_host._owner_identity(env) == {
-            key: marker[key] for key in sandbox_host._owner_identity(env) if key in marker
-        }:
+        if sandbox_host.marker_owned_by_env(marker, env):
             return None
     sock = state_dir() / "rfb.sock"
     return sock if _launcher_pid() is not None and sock.exists() else None
@@ -518,12 +514,17 @@ def sandbox_screen_running() -> bool:
     marker's recorded container still running. Only a sandbox that is provably gone (its container removed
     out from under us) drops the marker, so the next start rebuilds instead of the browser exec-ing into a
     dead container; an unregistered-but-alive one is re-attached by ``_sandbox_env(create=True)`` at the
-    next spawn (the terminal planner reuses the persisted container by label)."""
+    next spawn (the terminal planner reuses the persisted container by label). A marker naming a different
+    backend's sandbox (stale after a terminal backend change) is not running even when its container is
+    still alive elsewhere."""
     from tools.bot_desktop import sandbox_host
     marker = sandbox_host._read_marker()
     if not marker:
         return False
-    if _sandbox_env(create=False) is not None:
+    env = _sandbox_env(create=False)
+    if env is not None:
+        if not sandbox_host.marker_owned_by_env(marker, env):
+            return False
         return True
     if sandbox_host.marker_sandbox_alive(marker):
         return True
@@ -533,7 +534,8 @@ def sandbox_screen_running() -> bool:
 
 def _owned_sandbox_env():
     """The environment hosting the screen the marker records, re-attaching after a restart when the recorded
-    sandbox is still alive; None when there is no marker or its sandbox is gone. Never builds a sandbox for
+    sandbox is still alive; None when there is no marker, its sandbox is gone, or the marker names a
+    different backend's sandbox (stale after a terminal backend change). Never builds a sandbox for
     a screen that is not there."""
     from tools.bot_desktop import sandbox_host
     marker = sandbox_host._read_marker()
@@ -541,9 +543,14 @@ def _owned_sandbox_env():
         return None
     env = _sandbox_env(create=False)
     if env is not None:
+        if not sandbox_host.marker_owned_by_env(marker, env):
+            return None
         return env
     if sandbox_host.marker_sandbox_alive(marker):
-        return _sandbox_env(create=True)
+        env = _sandbox_env(create=True)
+        if env is not None and not sandbox_host.marker_owned_by_env(marker, env):
+            return None
+        return env
     return None
 
 
@@ -554,7 +561,8 @@ def is_running() -> bool:
 def open_rfb_stream() -> "subprocess.Popen":
     """Popen whose stdin/stdout carry RFB bytes for a sandbox-hosted screen (``in_sandbox()`` only)."""
     from tools.bot_desktop import sandbox_host
-    env = _sandbox_env(create=False)
+    marker = sandbox_host._read_marker()
+    env = _owned_sandbox_env() if marker else _sandbox_env(create=False)
     if env is None:
         raise RuntimeError("the sandbox hosting this screen is not running")
     return sandbox_host.open_rfb_stream(env, _profile_name())
@@ -571,10 +579,19 @@ def status(profile: Optional[str] = None) -> DesktopStatus:
     from tools.bot_desktop import resources
     from tools.bot_desktop import sandbox_host
     where = placement.resolve()
-    if where.where == placement.TERMINAL or sandbox_host._read_marker():
-        # A screen already running inside a sandbox is reported (and stoppable) even after the placement
-        # setting moved: the recorded owner wins over the current policy until it is stopped.
+    if where.where == placement.TERMINAL:
         return _sandbox_status(profile, where)
+    marker = sandbox_host._read_marker()
+    if marker:
+        # A screen already running inside a sandbox is reported (and stoppable) even after the placement
+        # setting moved: the recorded owner wins over the current policy until it is stopped. A stale
+        # marker naming a different backend's sandbox is not ours: report the host screen instead.
+        env = _sandbox_env(create=False)
+        if env is not None:
+            if sandbox_host.marker_owned_by_env(marker, env):
+                return _sandbox_status(profile, where)
+        elif sandbox_host.marker_sandbox_alive(marker):
+            return _sandbox_status(profile, where)
     missing: list[str] = missing_binaries() if is_supported_host() else list(REQUIRED_BINARIES)
     pid = _launcher_pid()
     env = published_env()
@@ -807,15 +824,6 @@ def _start_in_sandbox(wait_seconds: float) -> DesktopStatus:
     (sd / "env").write_text("".join(f"{k}={v}\n" for k, v in published.items()), encoding="utf-8")
     touch_activity()
     return status()
-
-
-def _sandbox_published_env() -> Dict[str, str]:
-    """Published env of a sandbox-hosted screen (the caller saw the host-side marker written at start)."""
-    from tools.bot_desktop import sandbox_host
-    env = _sandbox_env(create=False)
-    if env is None:
-        return {}
-    return sandbox_host.published_env(env, _profile_name())
 
 
 def stop() -> bool:

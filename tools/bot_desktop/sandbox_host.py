@@ -74,6 +74,18 @@ def _owner_identity(env: Any) -> Dict[str, Any]:
     return ident
 
 
+def marker_owned_by_env(marker: Dict[str, Any], env: Any) -> bool:
+    """Whether ``marker`` names ``env``'s sandbox. A stale marker from a previous terminal backend must not
+    route Local probes into sandbox exec: the container is the identity when either side names one (the
+    backend name differs for test stand-ins, so it is ignored there); otherwise the backend must match."""
+    if not marker or env is None:
+        return False
+    ident = _owner_identity(env)
+    if "container" in marker or "container" in ident:
+        return ident.get("container") == marker.get("container")
+    return ident.get("backend") == marker.get("backend")
+
+
 _ALIVE_CACHE: Dict[str, tuple[float, bool]] = {}
 
 

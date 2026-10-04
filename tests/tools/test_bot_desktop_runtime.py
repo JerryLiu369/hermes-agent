@@ -550,3 +550,66 @@ def test_sandbox_host_published_env_and_stop_safe_on_local_env():
     assert sandbox_host.published_env(DummyLocalEnv(), "default") == {}
     assert sandbox_host.stop(None, "default") is False
     assert sandbox_host.stop(DummyLocalEnv(), "default") is False
+
+
+def test_sandbox_screen_running_false_for_stale_marker(monkeypatch):
+    """A marker naming a Docker container is not running when the current env is Local, even when that
+    container is still alive elsewhere: ownership wins over liveness."""
+    from tools.bot_desktop import sandbox_host
+    marker = {"backend": "DockerEnvironment", "container": "c123"}
+
+    class DummyLocalEnv:
+        pass
+
+    monkeypatch.setattr(sandbox_host, "_read_marker", lambda: marker)
+    monkeypatch.setattr(runtime, "_sandbox_env", lambda *, create=False: DummyLocalEnv())
+    monkeypatch.setattr(sandbox_host, "_owner_identity", lambda env: {"backend": "LocalEnvironment"})
+    monkeypatch.setattr(sandbox_host, "marker_sandbox_alive", lambda m: True)
+
+    assert runtime.sandbox_screen_running() is False
+
+
+def test_status_ignores_stale_marker_from_different_backend(monkeypatch, tmp_path):
+    """status() with a stale Docker marker + Local backend must report the live host screen, never probe
+    the sandbox (missing_binaries would raise LocalEnvironment-cannot-exec)."""
+    from tools.bot_desktop import placement, sandbox_host
+    marker = {"backend": "DockerEnvironment", "container": "c123"}
+
+    class DummyLocalEnv:
+        pass
+
+    monkeypatch.setattr(sandbox_host, "_read_marker", lambda: marker)
+    monkeypatch.setattr(runtime, "_sandbox_env", lambda *, create=False: DummyLocalEnv())
+    monkeypatch.setattr(sandbox_host, "_owner_identity", lambda env: {"backend": "LocalEnvironment"})
+    monkeypatch.setattr(placement, "resolve", lambda: placement.Placement(placement.GATEWAY, "local"))
+    monkeypatch.setattr(sandbox_host, "missing_binaries",
+                        lambda env: pytest.fail("Must not probe sandbox missing_binaries for a stale marker"))
+    monkeypatch.setattr(sandbox_host, "published_env",
+                        lambda env, prof: pytest.fail("Must not probe sandbox published_env for a stale marker"))
+    monkeypatch.setattr(runtime, "missing_binaries", lambda: [])
+    monkeypatch.setattr(runtime, "_launcher_pid", lambda: 1234)
+    monkeypatch.setattr(runtime, "state_dir", lambda: tmp_path)
+    monkeypatch.setattr(runtime, "geometry", lambda: "1440x900")
+    (tmp_path / "env").write_text("DISPLAY=:42\n", encoding="utf-8")
+
+    st = runtime.status()
+    assert st.running is True and st.display == ":42" and st.placement == "gateway"
+
+
+def test_open_rfb_stream_not_running_for_stale_marker(monkeypatch):
+    """open_rfb_stream() with a stale marker must raise not-running, never LocalEnvironment-cannot-exec."""
+    from tools.bot_desktop import sandbox_host
+
+    class DummyLocalEnv:
+        pass
+
+    marker = {"backend": "DockerEnvironment", "container": "c123"}
+    monkeypatch.setattr(sandbox_host, "_read_marker", lambda: marker)
+    monkeypatch.setattr(runtime, "_sandbox_env", lambda *, create=False: DummyLocalEnv())
+    monkeypatch.setattr(sandbox_host, "_owner_identity", lambda env: {"backend": "LocalEnvironment"})
+    monkeypatch.setattr(sandbox_host, "marker_sandbox_alive", lambda m: False)
+    monkeypatch.setattr(sandbox_host, "open_rfb_stream",
+                        lambda env, prof: pytest.fail("Must not exec into a stale backend"))
+
+    with pytest.raises(RuntimeError, match="not running"):
+        runtime.open_rfb_stream()
