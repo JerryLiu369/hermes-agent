@@ -21,7 +21,6 @@ from __future__ import annotations
 
 import logging
 import os
-import sys
 import sysconfig
 from pathlib import Path
 
@@ -40,18 +39,18 @@ def _committed_dependency_site_packages(project_root: Path) -> Path | None:
 
     Asked of PM's own committed selection -- the record ``activate_dependencies`` resolves
     at process boot -- rather than re-derived from this process's ``sys.path``: the record
-    belongs to this install (``install_state_dir``, shared by every profile it serves).
-    ``None`` (no committed generation, unreadable record, or missing tree) lets the
-    caller fall back to :func:`_active_runtime_site_packages`; only when that is also
-    empty does the pin reduce to the tree itself.
+    belongs to this install (``install_state_dir``, shared by every profile it serves). A
+    runner that owns its dependencies (wheel / pipx / developer venv / Nix: no committed
+    generation) has nothing to restore, so ``None`` means "pin the tree only" and nothing
+    is invented.
     """
     try:
         from pm.environments import committed_venv, site_packages
 
         environment = committed_venv(project_root)
     except Exception as exc:
-        # An unreadable record: let the caller fall back to the active runtime.
-        # The cron worker's own boot re-reads it and fails the dispatch with PM's error.
+        # An unreadable record: pin the tree only. The cron worker's own boot re-reads it and
+        # fails the dispatch with PM's error.
         logger.warning(
             "cron worker: could not read the committed dependency environment: %s", exc
         )
@@ -62,107 +61,25 @@ def _committed_dependency_site_packages(project_root: Path) -> Path | None:
     return selected if selected.is_dir() else None
 
 
-def _active_runtime_site_packages(worker_env: dict | None = None) -> list[Path]:
-    """Site-packages dirs this process actually imports from, in priority order.
-
-    Fallback when PM has no committed generation for the checkout (non-PM installs,
-    test checkouts, fallback paths): the worker inherits this interpreter
-    (``sys.executable``), so handing it the same third-party dirs keeps imports like
-    ``ruamel`` working. Sources, in order:
-
-    1. ``sys.path`` entries named ``site-packages``/``dist-packages`` that exist —
-       this covers the usual venv layout, ``PYTHONPATH``-injected generations, and
-       system site dirs alike, without trusting leaked ``VIRTUAL_ENV``/``PYTHONPATH``
-       provenance.
-    2. The ``sys.prefix``-derived site-packages (covers ``-S``/isolated launches
-       where ``site`` never added it to ``sys.path``).
-    3. The validated runtime venv's site-packages (``tools.environments
-       .local_pythonpath._validated_runtime_venv`` applied to the worker env's own
-       ``VIRTUAL_ENV``): the legacy ``<repo>/venv`` layout AND a real ``pyvenv.cfg``,
-       never an unrelated venv. Read from ``worker_env``, never ``os.environ`` — the
-       sanitizer already popped the marker from the child env, and ``os.environ`` can
-       describe the invoking shell's Python (``pm/environments.py``).
-
-    Empty when nothing usable exists — the caller then pins the tree only and
-    invents nothing.
-    """
-    ordered: list[Path] = []
-    seen: set[str] = set()
-
-    def _append(candidate: Path) -> None:
-        try:
-            if not candidate.is_dir():
-                return
-            key = str(candidate.resolve())
-        except OSError:
-            return
-        if key in seen:
-            return
-        seen.add(key)
-        ordered.append(candidate)
-
-    for entry in sys.path:
-        if not entry:
-            continue
-        try:
-            candidate = Path(entry)
-        except (OSError, ValueError):
-            continue
-        if candidate.name not in ("site-packages", "dist-packages"):
-            continue
-        _append(candidate)
-
-    try:
-        pyver = f"python{sys.version_info[0]}.{sys.version_info[1]}"
-        if os.name == "nt":
-            _append(Path(sys.prefix) / "Lib" / "site-packages")
-        else:
-            _append(Path(sys.prefix) / "lib" / pyver / "site-packages")
-    except (OSError, ValueError):
-        pass
-
-    env = worker_env if worker_env is not None else {}
-    try:
-        from tools.environments.local_pythonpath import _validated_runtime_venv
-
-        from pm.environments import site_packages as _validated_site_packages
-
-        validated = _validated_runtime_venv(env)
-    except Exception:
-        validated = None
-    if validated is not None:
-        try:
-            _append(_validated_site_packages(validated))
-        except (OSError, ValueError):
-            pass
-
-    return ordered
-
-
 def pin_hermes_tree_on_pythonpath(worker_env: dict, repo_root: Path) -> dict:
-    """Prepend ``repo_root`` -- and the dependency ``site-packages`` -- to the worker env's
-    own PYTHONPATH (never ``os.environ``'s).
+    """Prepend ``repo_root`` -- and, when this runner has one, the committed dependency
+    generation's ``site-packages`` -- to the worker env's own PYTHONPATH (never
+    ``os.environ``'s).
 
     Skipped when ``repo_root`` is the interpreter's ``purelib``: under a wheel / pipx /
     uv-tool install ``cron/`` lives in site-packages itself, which is already importable,
     and pinning it would move site-packages ahead of the stdlib on ``sys.path``.
 
     Order (checkout, generation, sanitizer-kept) mirrors ``activate_dependencies``' own
-    ``sys.path``. The generation is the committed PM selection when one exists; otherwise
-    the current active runtime site-packages from ``sys.path``/venv (``#127016``) so a
-    bare store Python worker still finds third-party deps like ``ruamel``. For the cron
-    worker, its boot (``cron/worker_bootstrap.py``) then re-selects and leases the
-    committed generation before any third-party import, and exits the worker if it cannot.
+    ``sys.path``. For the cron worker, its boot (``cron/worker_bootstrap.py``) then re-selects
+    and leases the committed generation before any third-party import, and exits the worker
+    if it cannot.
     """
     root = str(repo_root)
     if _installed_purelib() == Path(root).resolve():
         return worker_env
     existing = [e for e in worker_env.get("PYTHONPATH", "").split(os.pathsep) if e]
     dependency = _committed_dependency_site_packages(Path(root))
-    if dependency is not None:
-        dependencies = [str(dependency)]
-    else:
-        dependencies = [str(p) for p in _active_runtime_site_packages(worker_env)]
-    pinned = [root, *dependencies]
+    pinned = [root, *([str(dependency)] if dependency is not None else [])]
     worker_env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys([*pinned, *existing]))
     return worker_env

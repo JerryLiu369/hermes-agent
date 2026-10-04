@@ -675,24 +675,12 @@ def test_launch_external_worker_pin_extends_the_sanitized_env_not_os_environ(
         lambda **_: {"PATH": os.environ.get("PATH", ""),
                      "PYTHONPATH": str(tmp_path / "kept-by-sanitizer")},
     )
-    # Deterministic fallback (#127016): no committed generation here, so the pin
-    # restores one known active runtime dir instead of whatever this checkout's
-    # real install state happens to hold.
-    fallback = tmp_path / "fallback-deps"
-    fallback.mkdir(exist_ok=True)
-    monkeypatch.setattr(
-        worker_env_mod, "_committed_dependency_site_packages", lambda _root: None
-    )
-    monkeypatch.setattr(
-        worker_env_mod, "_active_runtime_site_packages", lambda *a, **k: [fallback]
-    )
     spawned, _payloads, _handoff, _get = _stub_external_worker_launch(scheduler, monkeypatch)
     repo_root = Path(scheduler.__file__).resolve().parent.parent
 
     assert scheduler._launch_external_cron_worker(job) is True
     entries = spawned[0][1]["env"]["PYTHONPATH"].split(os.pathsep)
-    assert entries == [str(repo_root), str(fallback), str(tmp_path / "kept-by-sanitizer")]
-    assert str(tmp_path / "raw-environ-only") not in entries
+    assert entries == [str(repo_root), str(tmp_path / "kept-by-sanitizer")]
 
     # Wheel / pipx layout: repo_root == purelib -> untouched.
     monkeypatch.setattr(worker_env_mod, "_installed_purelib", lambda: repo_root)
@@ -727,12 +715,11 @@ def _commit_generation(repo_root: Path, name: str, *, with_site_packages: bool) 
     return venv
 
 
-def test_pin_restores_the_committed_generation_site_packages(tmp_path, monkeypatch):
+def test_pin_restores_the_committed_generation_site_packages(tmp_path):
     """#122222: the sanitizer drops the generation ``activate_dependencies`` put on our
     ``sys.path``, and the worker inherits the store Python, which owns no dependencies. The
     pin hands the child PM's committed generation -- after the checkout, before the entries
-    the sanitizer kept -- and falls back to the active runtime site-packages (#127016)
-    when no generation is committed, inventing nothing only when neither exists."""
+    the sanitizer kept -- and invents nothing when no generation is committed."""
     import cron.scheduler_worker_env as worker_env_mod
     import pm.environments
 
@@ -748,20 +735,8 @@ def test_pin_restores_the_committed_generation_site_packages(tmp_path, monkeypat
         str(repo_root), str(selected), str(tmp_path / "kept"),
     ]
 
-    # No committed generation: fall back to the active runtime site-packages so a
-    # bare store Python worker still finds third-party deps like `ruamel`.
+    # A runner that owns its dependencies has no committed generation: tree only.
     pm.environments.runtime_facts_path(repo_root).unlink()
-    fallback_dir = tmp_path / "fallback-site-packages"
-    fallback_dir.mkdir()
-    monkeypatch.setattr(
-        worker_env_mod, "_active_runtime_site_packages", lambda *a, **k: [fallback_dir]
-    )
-    assert worker_env_mod.pin_hermes_tree_on_pythonpath({}, repo_root) == {
-        "PYTHONPATH": os.pathsep.join([str(repo_root), str(fallback_dir)])
-    }
-
-    # Neither committed nor active: tree only, nothing invented.
-    monkeypatch.setattr(worker_env_mod, "_active_runtime_site_packages", lambda *a, **k: [])
     assert worker_env_mod.pin_hermes_tree_on_pythonpath({}, repo_root) == {
         "PYTHONPATH": str(repo_root)
     }
@@ -786,16 +761,10 @@ def test_marked_worker_boots_dependencies_before_cron_jobs(marked):
     children do not inherit it. An unmarked importer (the gateway already booted through
     ``hermes_bootstrap``) is never re-booted."""
     import cron.worker_bootstrap as worker_bootstrap
-    from cron.scheduler_worker_env import _active_runtime_site_packages
 
     repo_root = Path(worker_bootstrap.__file__).resolve().parent.parent
     env = {k: v for k, v in os.environ.items() if k != worker_bootstrap.WORKER_MARKER}
-    # The mocked boot below records but does not activate, so the probe needs the
-    # same dependency dirs the real worker pin provides (#127016): repo root plus
-    # this process's active runtime site-packages, or `import cron` dies with
-    # `ModuleNotFoundError: ruamel` before the assertion runs.
-    fallbacks = [str(p) for p in _active_runtime_site_packages()]
-    env["PYTHONPATH"] = os.pathsep.join(dict.fromkeys([str(repo_root), *fallbacks]))
+    env["PYTHONPATH"] = str(repo_root)
     if marked:
         env[worker_bootstrap.WORKER_MARKER] = "1"
     child = subprocess.run(
@@ -880,6 +849,63 @@ def test_marked_worker_exits_before_cron_jobs_when_activation_fails():
     assert result["jobs"] is False
 
 
+_NO_COMMITTED_REAL_BOOT_PROBE = """
+import json, sys
+try:
+    import cron
+    print(json.dumps({"ok": True, "jobs": "cron.jobs" in sys.modules}))
+except RuntimeError as exc:
+    print(json.dumps({"ok": False, "error": str(exc), "jobs": "cron.jobs" in sys.modules}))
+"""
+
+
+def test_no_committed_generation_worker_boots_without_fallback(tmp_path):
+    """#130269 review: a marked worker with no committed generation goes through the REAL
+    bootstrap -- ``worker_bootstrap()`` plus the REAL ``activate_dependencies()`` (no lambda
+    substitution, no stubbed ``_require_own_dependencies``) -- on a supported layout (this
+    test interpreter keeps the packages it booted with, per ``pm.environments``
+    semantics), and the tree-only pin is already sufficient.
+
+    Evidence for leaving ``pin_hermes_tree_on_pythonpath`` without a parent
+    site-packages fallback: the tree-only pin boots clean here, and prepending an extra
+    site-packages dir (exactly what the proposed ``_active_runtime_site_packages``
+    fallback would add) changes nothing -- both children report the same success. The
+    fallback cannot repair the remaining layout either: ``_require_own_dependencies``
+    decides on ``sys.prefix``/``sys.base_prefix`` vs the store root and never consults
+    ``PYTHONPATH``, so a bare store Python child raises ``no dependency environment is
+    committed for this install`` with or without the extra entries (verified manually
+    with the store interpreter under ``-s``: repo-only and repo-plus-fallback pins fail
+    identically, before the ownership acknowledgement)."""
+    import cron.worker_bootstrap as worker_bootstrap
+    import pm.environments as pm_env
+
+    repo_root = Path(worker_bootstrap.__file__).resolve().parent.parent
+    # Hermetic no-committed-generation premise: the suite isolates HERMES_HOME per test,
+    # so this checkout has no selection record here.
+    assert not pm_env.runtime_facts_path(repo_root).exists()
+    assert pm_env.committed_venv(repo_root) is None
+    # Supported-layout premise, via the REAL ownership check (not mocked): this
+    # interpreter keeps its booted packages, so the child below does too.
+    pm_env._require_own_dependencies(repo_root)
+
+    def _run_marked(pythonpath_entries):
+        env = {k: v for k, v in os.environ.items() if k != worker_bootstrap.WORKER_MARKER}
+        env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
+        env[worker_bootstrap.WORKER_MARKER] = "1"
+        child = subprocess.run(
+            [sys.executable, "-c", _NO_COMMITTED_REAL_BOOT_PROBE],
+            cwd=repo_root, env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert child.returncode == 0, child.stderr
+        return json.loads(child.stdout.strip().splitlines()[-1])
+
+    assert _run_marked([str(repo_root)]) == {"ok": True, "jobs": True}
+
+    extra = tmp_path / "extra-site-packages"
+    extra.mkdir()
+    assert _run_marked([str(repo_root), str(extra)]) == {"ok": True, "jobs": True}
+
+
 def test_shared_run_path_hands_gateway_fire_to_external_worker(monkeypatch):
     import cron.scheduler as scheduler
 
@@ -940,6 +966,59 @@ def test_dispatch_failure_opens_incident_and_delivers_failure_notice(
     assert len(delivered) == 1
     assert execution_ledger.get_execution(repeat["id"])["delivery_outcome"] == \
         "suppressed_acked"
+
+
+@pytest.mark.parametrize("failing_stage", ["handoff", "claim_dispatch"])
+def test_dispatch_failure_notice_resolves_the_owning_profiles_home_channel(
+    execution_ledger, monkeypatch, tmp_path, failing_stage
+):
+    """Under multiplex the failure notice for a failed handoff resolves the job's home channel
+    through ``get_secret``. The in-process run path installs the owning profile's secret scope
+    before delivery; the dispatch-failure branch must too, or the read fails closed with
+    UnscopedSecretError and the notice never leaves. Same for a crash in the in-process body
+    before the run starts (``claim_dispatch`` raising)."""
+    import cron.incidents as incidents
+    import cron.scheduler as scheduler
+    import cron.scheduler_delivery as delivery
+    from agent import secret_scope
+
+    home = tmp_path / "profiles" / "worker"
+    home.mkdir(parents=True)
+    (home / ".env").write_text('TELEGRAM_HOME_CHANNEL="111111111"\n', encoding="utf-8")
+    monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: home)
+    monkeypatch.delenv("TELEGRAM_HOME_CHANNEL", raising=False)
+
+    def _handoff_boom(_job):
+        raise RuntimeError("worker exited before ownership acknowledgement")
+
+    if failing_stage == "handoff":
+        monkeypatch.setattr(scheduler, "_launch_external_cron_worker", _handoff_boom)
+    else:
+        monkeypatch.setattr(scheduler, "_launch_external_cron_worker", lambda _job: False)
+        monkeypatch.setattr(scheduler, "claim_dispatch", _handoff_boom)
+    monkeypatch.setattr(scheduler, "mark_job_run", lambda *_a, **_k: True)
+    resolved = []
+
+    def _deliver(job, content, **_kw):
+        resolved.append(delivery._env_home_target_chat_id("telegram"))
+        return None
+
+    monkeypatch.setattr(scheduler, "_deliver_result", _deliver)
+
+    record = execution_ledger.create_execution("job-scoped", source="builtin")
+    job = {"id": "job-scoped", "execution_id": record["id"], "deliver": "telegram"}
+    secret_scope.set_multiplex_active(True)
+    try:
+        assert secret_scope.current_secret_scope() is None
+        assert scheduler.run_one_job(job, adapters=None) is (failing_stage == "handoff")
+        assert secret_scope.current_secret_scope() is None  # scope does not leak past the fire
+    finally:
+        secret_scope.set_multiplex_active(False)
+
+    assert resolved == ["111111111"]
+    assert len(incidents.list_incidents()) == 1
+    finished = execution_ledger.get_execution(record["id"])
+    assert finished["delivery_outcome"] == "delivered"
 
 
 def test_shutdown_does_not_interrupt_restart_safe_waiter():
@@ -1228,124 +1307,42 @@ def test_post_handoff_waiter_failure_records_bookkeeping_without_alert(
     assert execution_ledger.get_execution(record["id"])["status"] == "failed"
 
 
-def _isolate_active_runtime_sources(monkeypatch, tmp_path, repo):
-    """Leave only the VIRTUAL_ENV source: empty sys.path entries, dead sys.prefix,
-    no PM facts, and repo-root aliases reduced to ``repo``."""
-    import sys
+def test_restart_wait_counts_exclude_only_scoped_workers(tmp_path, monkeypatch):
+    """Only a worker in its OWN scope may be skipped by the gateway restart wait.
 
-    import pm.environments as pm_env
-    import tools.environments.local as local_mod
+    A ``degraded`` dispatch is still an external subprocess but stays in the gateway cgroup, so a
+    systemd stop kills it mid-run and the restart wait must keep holding for it. A run the scheduler
+    already reports as wedged is excluded too: the gateway subtracts both counts, and a run in both
+    sets would be subtracted twice.
+    """
+    import cron.scheduler as scheduler
 
-    monkeypatch.setattr(sys, "path", [], raising=False)
-    monkeypatch.setattr(sys, "prefix", str(tmp_path / "no-prefix"), raising=False)
-    monkeypatch.setattr(
-        pm_env, "runtime_facts_path", lambda _root: tmp_path / "no-facts.json"
-    )
-    monkeypatch.setattr(local_mod, "_hermes_repo_root_aliases", (repo,))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("cron.jobs.load_jobs", lambda: [])
+    jobs = ("job-scoped", "job-degraded", "job-scoped-wedged")
+    for job_id in jobs:
+        assert scheduler.try_register_running_job(job_id)
+    try:
+        scheduler._record_external_cron_worker("job-scoped", 4321, scope_isolated=True)
+        scheduler._record_external_cron_worker("job-degraded", 4322, scope_isolated=False)
+        scheduler._record_external_cron_worker("job-scoped-wedged", 4323, scope_isolated=True)
+        assert scheduler.get_restart_wait_cron_counts() == {
+            "awaitable": 1, "wedged": 0, "restart_safe": 2}
+        details = {d["job_id"]: d["restart_safe"] for d in scheduler.get_running_job_details()}
+        assert details == {"job-scoped": True, "job-degraded": False, "job-scoped-wedged": True}
 
-
-def _make_validated_venv(repo: Path) -> tuple[Path, Path]:
-    """Create ``<repo>/venv`` with a real ``pyvenv.cfg`` and its site-packages dir;
-    return ``(venv, site-packages)`` using PM's own layout (version from this interpreter)."""
-    import sys
-
-    import pm.environments as pm_env
-
-    version = f"{sys.version_info[0]}.{sys.version_info[1]}"
-    venv = repo / "venv"
-    venv.mkdir(parents=True, exist_ok=True)
-    (venv / "pyvenv.cfg").write_text(f"version = {version}\n", encoding="utf-8")
-    selected = pm_env.site_packages(venv)
-    selected.mkdir(parents=True, exist_ok=True)
-    return venv, selected
-
-
-def test_active_runtime_site_packages_gates_virtual_env(tmp_path, monkeypatch):
-    """#130269 review: ``VIRTUAL_ENV`` alone is not provenance. Only the validated
-    ``<repo>/venv`` (spelling + real ``pyvenv.cfg``) contributes; a foreign tree —
-    even with an existing same-version ``site-packages`` — a missing ``pyvenv.cfg``,
-    or a wrong-version tree contributes nothing."""
-    import sys
-
-    import cron.scheduler_worker_env as worker_env_mod
-    import pm.environments as pm_env
-
-    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    _isolate_active_runtime_sources(monkeypatch, tmp_path, repo)
-    venv, expected_sp = _make_validated_venv(repo)
-
-    # Validated repo venv is accepted.
-    result = worker_env_mod._active_runtime_site_packages({"VIRTUAL_ENV": str(venv)})
-    assert str(expected_sp) in [str(p) for p in result]
-
-    # Same spelling without pyvenv.cfg is rejected.
-    (venv / "pyvenv.cfg").unlink()
-    assert worker_env_mod._active_runtime_site_packages({"VIRTUAL_ENV": str(venv)}) == []
-    version = f"{sys.version_info[0]}.{sys.version_info[1]}"
-    (venv / "pyvenv.cfg").write_text(f"version = {version}\n", encoding="utf-8")
-
-    # Foreign venv with a real pyvenv.cfg and an existing same-version tree is
-    # still rejected: provenance, not mere existence.
-    foreign = tmp_path / "foreign-venv"
-    foreign_sp = foreign / "lib" / f"python{version}" / "site-packages"
-    foreign_sp.mkdir(parents=True)
-    (foreign / "pyvenv.cfg").write_text(f"version = {version}\n", encoding="utf-8")
-    assert worker_env_mod._active_runtime_site_packages({"VIRTUAL_ENV": str(foreign)}) == []
-
-    # Foreign tree without pyvenv.cfg is rejected (the old code accepted it on
-    # ``is_dir`` alone).
-    foreign_bare = tmp_path / "foreign-bare"
-    (foreign_bare / "lib" / f"python{version}" / "site-packages").mkdir(parents=True)
-    assert (
-        worker_env_mod._active_runtime_site_packages({"VIRTUAL_ENV": str(foreign_bare)})
-        == []
-    )
-
-    # Wrong-version foreign tree is rejected as foreign, not coincidentally.
-    wrong = "python3.7" if version != "3.7" else "python3.8"
-    foreign_wrong = tmp_path / "foreign-wrong"
-    (foreign_wrong / "lib" / wrong / "site-packages").mkdir(parents=True)
-    assert (
-        worker_env_mod._active_runtime_site_packages({"VIRTUAL_ENV": str(foreign_wrong)})
-        == []
-    )
-    _ = pm_env  # keep import used if layout helpers change
-
-
-def test_active_runtime_site_packages_reads_worker_env_not_os_environ(
-    tmp_path, monkeypatch
-):
-    """#130269 review: the marker is read from the worker env — the only env the
-    caller has — never ``os.environ``, which can describe the invoking shell's Python."""
-    import cron.scheduler_worker_env as worker_env_mod
-
-    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
-    repo = tmp_path / "repo2"
-    repo.mkdir()
-    _isolate_active_runtime_sources(monkeypatch, tmp_path, repo)
-    venv, expected_sp = _make_validated_venv(repo)
-
-    # Marker only in os.environ is ignored.
-    monkeypatch.setenv("VIRTUAL_ENV", str(venv))
-    assert worker_env_mod._active_runtime_site_packages({}) == []
-    assert worker_env_mod._active_runtime_site_packages(None) == []
-
-    # Same marker carried by the worker env is honoured.
-    result = worker_env_mod._active_runtime_site_packages({"VIRTUAL_ENV": str(venv)})
-    assert str(expected_sp) in [str(p) for p in result]
-
-    # The pin threads the worker env through: a foreign os.environ marker never leaks in.
-    monkeypatch.setattr(
-        worker_env_mod, "_committed_dependency_site_packages", lambda _root: None
-    )
-    foreign = tmp_path / "foreign-env"
-    foreign.mkdir()
-    monkeypatch.setenv("VIRTUAL_ENV", str(foreign))
-    pinned = worker_env_mod.pin_hermes_tree_on_pythonpath({}, repo)
-    assert pinned["PYTHONPATH"].split(os.pathsep) == [str(repo)]
-    pinned_with = worker_env_mod.pin_hermes_tree_on_pythonpath(
-        {"VIRTUAL_ENV": str(venv)}, repo
-    )
-    assert str(expected_sp) in pinned_with["PYTHONPATH"].split(os.pathsep)
+        with scheduler._running_lock:
+            scheduler._running_since[scheduler._inflight_key("job-scoped-wedged")] = (
+                time.time() - 702 * 60)
+        assert scheduler.get_wedged_job_ids() == frozenset({"job-scoped-wedged"})
+        # Wedged and scoped: counted once, as wedged.
+        assert scheduler.get_restart_wait_cron_counts() == {
+            "awaitable": 1, "wedged": 1, "restart_safe": 1}
+    finally:
+        for job_id in jobs:
+            scheduler.release_running_job(job_id)
+    # Scoped to THIS test's claims: the module keeps other runs' entries (a launch that never went
+    # through a claim, e.g. a stubbed worker in a sibling test, is not this test's to assert on).
+    keys = {scheduler._inflight_key(job_id) for job_id in jobs}
+    assert not keys & scheduler._scope_isolated_job_ids
+    assert not keys & set(scheduler._running_worker_pids)
