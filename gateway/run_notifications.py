@@ -981,12 +981,13 @@ class GatewayNotificationsMixin:
     def _planned_restart_marker_is_dischargeable(self, data: dict) -> bool:
         """True when a ``.restart_pending.json`` marker owes no further notice, so it is safe to discard.
 
-        Either every owed target is already recorded delivered, or the marker aged out. A fresh,
-        fully-undelivered obligation returns False: a non-restart stop must not erase it (#127316
-        follow-up), and the age bound from finding 1 will eventually discharge an unreachable one.
+        Shutdown-only gate: every currently owed target is already recorded delivered. Age-based
+        expiry lives ONLY in the boot-replay path, after reachable targets have been tried — a
+        non-restart stop never attempts delivery, so it must not expire an undelivered marker
+        from age alone, or a reachable home is never attempted (#127316 follow-up).
         """
         delivered = {tuple(target) for target in data.get("delivered_targets", [])}
-        return self._planned_restart_marker_expired(data) or self._owed_home_channel_targets() <= delivered
+        return self._owed_home_channel_targets() <= delivered
 
     async def _replay_pending_planned_restart_notification(self) -> None:
         """Send the planned-restart online notice to every home channel still owed one; clear

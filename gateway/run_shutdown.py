@@ -2134,9 +2134,11 @@ class GatewayShutdownMixin:
                 )
         elif not self._restart_requested:
             # Clean shutdown with no restart requested. Discard a leftover planned-restart marker only
-            # when it owes nothing (spent or aged out): a fresh marker records an undelivered
-            # obligation, and a supervisor/SIGTERM stop landing before the boot replay must not erase
-            # it (#127316 follow-up). Unreadable state keeps the marker — never fail into data loss.
+            # when every currently owed target is already recorded delivered: the marker records an
+            # undelivered obligation, and a supervisor/SIGTERM stop landing before the boot replay
+            # must not erase it — age-based expiry lives only in the boot replay, after reachable
+            # targets have been tried (#127316 follow-up). Unreadable state keeps the marker —
+            # never fail into data loss.
             with suppress(Exception):
                 _pending_path = _planned_restart_notification_path()
                 if _pending_path.exists():

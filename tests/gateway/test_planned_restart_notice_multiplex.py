@@ -333,7 +333,7 @@ async def test_non_restart_stop_keeps_undelivered_restart_obligation(tmp_path, m
 
     A supervisor/SIGTERM stop landing between the restart write and the boot replay used to hit the
     clean-shutdown branch and erase a fresh, fully-undelivered obligation, so no channel was ever
-    notified. The marker is discarded only when spent or expired — never just because this stop was
+    notified. The marker is discarded only when spent — never just because this stop was
     not a restart (#127316 follow-up).
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -363,6 +363,43 @@ async def test_non_restart_stop_keeps_undelivered_restart_obligation(tmp_path, m
     assert marker.exists(), "a fully-undelivered obligation must survive a non-restart stop"
 
     # 3) Next boot delivers the owed notice exactly once.
+    await runner._replay_pending_planned_restart_notification()
+    runner.adapters[Platform.DISCORD].send.assert_awaited_once()
+    assert not marker.exists()
+
+
+@pytest.mark.asyncio
+async def test_aged_undelivered_marker_survives_non_restart_stop_until_replay(tmp_path, monkeypatch):
+    """An aged-but-undelivered marker survives a non-restart stop; expiry runs only in replay.
+
+    Reviewer sequence: a planned restart writes the marker, the host stays down past the 1h
+    age bound, then the new process stops again before the boot replay. Shutdown must not
+    expire the marker from age alone — the next boot replay attempts the reachable home first
+    and only then expires the unreachable residue.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.config = _home_config(Platform.DISCORD, "launch-home")
+    runner._profile_configs = {}
+    runner.adapters = {Platform.DISCORD: _adapter()}
+    runner._free_tier_startup_line = Mock(return_value=None)
+    runner._planned_restart_notice_lock = None
+    runner._update_runtime_status = Mock()
+    marker = tmp_path / ".restart_pending.json"
+    # Backdate an undelivered marker by 65 minutes past _MAX_PLANNED_RESTART_NOTICE_AGE_SECS.
+    marker.write_text(json.dumps({"requested_at": time.time() - 3900}), encoding="utf-8")
+    ctx = SimpleNamespace(timed_out=False, active_agents={}, elapsed=lambda: 0.1)
+
+    runner._restart_requested = False
+    runner._restart_command_source = None
+    runner._restart_via_service = False
+    runner._restart_detached = False
+    runner._exit_reason = None
+    await runner._stop_persist_exit_state(ctx)
+    assert marker.exists(), "shutdown must not expire an undelivered marker from age alone"
+    runner.adapters[Platform.DISCORD].send.assert_not_awaited()
+
     await runner._replay_pending_planned_restart_notification()
     runner.adapters[Platform.DISCORD].send.assert_awaited_once()
     assert not marker.exists()
