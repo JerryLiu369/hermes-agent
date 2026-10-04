@@ -4716,8 +4716,8 @@ class TelegramAdapter(BasePlatformAdapter):
         The stored prompt is already-escaped HTML; the plain-text decision is
         escaped on append so audit context (the command) survives resolution
         (#128982). Over-budget bodies are cut with ``_ea_fit`` in UTF-16 units
-        plus HTML repair: never split an entity, and re-close a ``<pre>`` the
-        cut leaves open (the only tag spanning content in these prompts).
+        plus HTML repair: the cut is walked back to a tag/entity boundary
+        (never ``</b…``), and a tag the cut leaves open is re-closed.
         """
         if not prompt_text:
             return None
@@ -4727,12 +4727,20 @@ class TelegramAdapter(BasePlatformAdapter):
             return None
         body = prompt_text
         if utf16_len(body) > budget:
-            # Room for the "</pre>" repair below, which rides outside the fit.
-            reserve = len("</pre>") if "<pre>" in body else 0
+            # Room for the re-close repairs below, which ride outside the fit.
+            reserve = (len("</pre>") if "<pre>" in body else 0) + (len("</b>") if "<b>" in body else 0)
             body = self._ea_fit(body, max(0, budget - 1 - reserve), suffix="…", escape=lambda s: s)
-            body = re.sub(r"&[^;\s]*$", "", body)
-            if body.count("<pre>") > body.count("</pre>"):
-                body += "</pre>"
+            if body.endswith("…"):
+                # `_ea_fit` cuts at a length boundary that can land inside a
+                # tag or entity; walk back to the boundary so the payload
+                # still parses (#129161). Subsumes the old entity-only strip
+                # and keeps the "…" marker.
+                cut = re.search(r"<[^<>]*$|&[^;\s]*$", body[:-1])
+                if cut:
+                    body = body[:cut.start()] + "…"
+            for tag in ("b", "pre"):
+                if body.count(f"<{tag}>") > body.count(f"</{tag}>"):
+                    body += f"</{tag}>"
         return body + tail
 
     async def _edit_approval_resolution(self, query, prompt_text: str, decision: str) -> None:

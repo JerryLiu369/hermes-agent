@@ -1,6 +1,7 @@
 """Tests for Telegram inline keyboard approval buttons."""
 
 import os
+import re
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -471,3 +472,54 @@ class TestApprovalResolutionHtml:
         assert out.count("<pre>") == out.count("</pre>")
         assert "&am…" not in out and "&a…" not in out
 
+    def test_cut_sweep_never_splits_tag_or_entity(self):
+        """Pin the #129161 cut-boundary defect: over prompt lengths x
+        first_name lengths, no cut may land inside a tag (``</b…``) or an
+        entity, and the ``b``/``pre`` tags stay balanced and nested."""
+        adapter = _make_adapter()
+        prompts = set()
+        for reps in range(150, 260):
+            prompts.add(adapter._format_exec_approval(
+                "python -c " + "print('x'); " * reps, "Looks destructive", True))
+        cut, checked, failures = 0, 0, []
+        for prompt in sorted(prompts):
+            for fn_len in range(1, 65):
+                out = adapter._approval_resolution_html(
+                    prompt, "Approved once by " + "x" * fn_len)
+                assert out is not None
+                checked += 1
+                assert utf16_len(out) <= adapter.MAX_MESSAGE_LENGTH
+                if "…" not in out:
+                    continue
+                cut += 1
+                problems = []
+                tag_frag = re.search(r"<[^>…]*…", out)
+                if tag_frag:
+                    problems.append(f"cut-in-tag:{tag_frag.group(0)[-12:]}")
+                ent_frag = re.search(r"&[^;\s]*…", out)
+                if ent_frag:
+                    problems.append(f"cut-in-entity:{ent_frag.group(0)}")
+                stack = []
+                for m in re.finditer(r"<", out):
+                    tok = re.match(r"</?(?:b|pre)>", out[m.start():])
+                    if tok is None:
+                        problems.append(f"partial-tag:{out[m.start():m.start() + 12]}")
+                        break
+                    if tok.group(0).startswith("</"):
+                        if not stack or f"<{tok.group(0)[2:-1]}>" != stack[-1]:
+                            problems.append(f"mismatch:{tok.group(0)}")
+                            break
+                        stack.pop()
+                    else:
+                        stack.append(tok.group(0))
+                if stack:
+                    problems.append(f"unclosed:{stack}")
+                for m in re.finditer(r"&", out):
+                    if not re.compile(r"&(#\d+|#x[0-9a-fA-F]+|[A-Za-z]+);").match(out, m.start()):
+                        problems.append(f"bad-entity:{out[m.start():m.start() + 12]}")
+                        break
+                if problems and len(failures) < 5:
+                    idx = out.find("…")
+                    failures.append((fn_len, problems, out[max(0, idx - 40):idx + 20]))
+        assert cut > 0, "sweep produced no over-budget cuts"
+        assert not failures, f"{len(failures)} malformed payloads of {cut} cuts ({checked} checked)"
