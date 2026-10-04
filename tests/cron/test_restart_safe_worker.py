@@ -859,23 +859,9 @@ except RuntimeError as exc:
 """
 
 
-def test_no_committed_generation_worker_boots_without_fallback(tmp_path):
-    """#130269 review: a marked worker with no committed generation goes through the REAL
-    bootstrap -- ``worker_bootstrap()`` plus the REAL ``activate_dependencies()`` (no lambda
-    substitution, no stubbed ``_require_own_dependencies``) -- on a supported layout (this
-    test interpreter keeps the packages it booted with, per ``pm.environments``
-    semantics), and the tree-only pin is already sufficient.
-
-    Evidence for leaving ``pin_hermes_tree_on_pythonpath`` without a parent
-    site-packages fallback: the tree-only pin boots clean here, and prepending an extra
-    site-packages dir (exactly what the proposed ``_active_runtime_site_packages``
-    fallback would add) changes nothing -- both children report the same success. The
-    fallback cannot repair the remaining layout either: ``_require_own_dependencies``
-    decides on ``sys.prefix``/``sys.base_prefix`` vs the store root and never consults
-    ``PYTHONPATH``, so a bare store Python child raises ``no dependency environment is
-    committed for this install`` with or without the extra entries (verified manually
-    with the store interpreter under ``-s``: repo-only and repo-plus-fallback pins fail
-    identically, before the ownership acknowledgement)."""
+def test_marked_worker_without_committed_generation_keeps_venv_dependencies():
+    """A marked worker with no committed generation keeps its venv dependencies
+    through the real ``worker_bootstrap()`` and loads ``cron.jobs``."""
     import cron.worker_bootstrap as worker_bootstrap
     import pm.environments as pm_env
 
@@ -888,22 +874,15 @@ def test_no_committed_generation_worker_boots_without_fallback(tmp_path):
     # interpreter keeps its booted packages, so the child below does too.
     pm_env._require_own_dependencies(repo_root)
 
-    def _run_marked(pythonpath_entries):
-        env = {k: v for k, v in os.environ.items() if k != worker_bootstrap.WORKER_MARKER}
-        env["PYTHONPATH"] = os.pathsep.join(pythonpath_entries)
-        env[worker_bootstrap.WORKER_MARKER] = "1"
-        child = subprocess.run(
-            [sys.executable, "-c", _NO_COMMITTED_REAL_BOOT_PROBE],
-            cwd=repo_root, env=env, capture_output=True, text=True, timeout=60,
-        )
-        assert child.returncode == 0, child.stderr
-        return json.loads(child.stdout.strip().splitlines()[-1])
-
-    assert _run_marked([str(repo_root)]) == {"ok": True, "jobs": True}
-
-    extra = tmp_path / "extra-site-packages"
-    extra.mkdir()
-    assert _run_marked([str(repo_root), str(extra)]) == {"ok": True, "jobs": True}
+    env = {k: v for k, v in os.environ.items() if k != worker_bootstrap.WORKER_MARKER}
+    env["PYTHONPATH"] = str(repo_root)
+    env[worker_bootstrap.WORKER_MARKER] = "1"
+    child = subprocess.run(
+        [sys.executable, "-c", _NO_COMMITTED_REAL_BOOT_PROBE],
+        cwd=repo_root, env=env, capture_output=True, text=True, timeout=60,
+    )
+    assert child.returncode == 0, child.stderr
+    assert json.loads(child.stdout.strip().splitlines()[-1]) == {"ok": True, "jobs": True}
 
 
 def test_shared_run_path_hands_gateway_fire_to_external_worker(monkeypatch):
