@@ -1856,6 +1856,8 @@ def _credential_fingerprint(provider: str) -> str:
     API-key providers include their configured values and credential-file mtimes. Codex uses the
     stable principal selected by its read-only resolver: routine token and pool-state writes must
     not discard an account-scoped catalog, while a real account switch must invalidate it.
+    copilot-acp keeps tracking its hosts.json login signal for the same reason: the ACP
+    session is the only source reflecting the account's enablement.
     """
     import hashlib
 
@@ -1877,11 +1879,13 @@ def _credential_fingerprint(provider: str) -> str:
     # Their catalog never depends on a token file, so rotating OAuth credentials must not
     # invalidate it (Claude Code rewrites ~/.claude/.credentials.json on every refresh, #129094).
     is_external_process = False
+    ext_process_name = ""
     try:
         from providers import get_provider_profile
         profile = get_provider_profile(provider)
         if profile is not None and profile.auth_type == "external_process":
             is_external_process = True
+            ext_process_name = str(getattr(profile, "name", "") or "").lower()
             for ev in (*profile.process_command_env_vars, profile.process_args_env_var):
                 if ev:
                     parts.append(f"{ev}={os.environ.get(ev, '')}")
@@ -1941,7 +1945,13 @@ def _credential_fingerprint(provider: str) -> str:
         # handshake, so routine OAuth rotations must not discard the cached row
         # (#129094). TTL + SWR still bound staleness; a command/argv override
         # change (fingerprinted above) still invalidates.
-        pass
+        if ext_process_name == "copilot-acp":
+            # Exception: the ACP session is the only source reflecting the
+            # account's enablement, so a GitHub account switch (or logout) —
+            # visible as hosts.json changing — must invalidate the cached row
+            # rather than serve the previous account's catalog.
+            path = os.path.expanduser("~/.config/github-copilot/hosts.json")
+            _mtime_part(path, path)
     else:
         try:
             from hermes_constants import get_hermes_home

@@ -3,7 +3,10 @@
 An external-process provider's catalog comes from the launched program's
 handshake, not from any token file — so a routine OAuth rotation (Claude Code
 rewrites ``~/.claude/.credentials.json`` on every refresh) must not discard
-the cached row and drop the picker to ``fallback_models``.
+the cached row and drop the picker to ``fallback_models``. copilot-acp is the
+exception: the ACP session is the only source reflecting the account's
+enablement, so its hosts.json login signal stays fingerprinted and an account
+switch (or logout) invalidates the cached row.
 """
 
 import json
@@ -21,8 +24,14 @@ from hermes_cli.models import (
     update_provider_cache_entry,
 )
 
+# Runs on every host AND is imported by every OS lane (the Windows/macOS lanes
+# only import files carrying a platforms() spec): the fixture pins ~ resolution
+# via USERPROFILE/HOMEDRIVE/HOMEPATH, which only matters on native Windows.
+pytestmark = pytest.mark.platforms("any")
+
 PROVIDER = "fp-external-proc"
 CONTROL = "fp-control-never-registered"
+COPILOT_ACP = "copilot-acp"
 
 
 def _fake_profile(**overrides):
@@ -41,6 +50,12 @@ def isolated_creds(tmp_path, monkeypatch):
     home = tmp_path / "home"
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
+    # os.path.expanduser reads USERPROFILE (then HOMEDRIVE/HOMEPATH), not HOME,
+    # on Windows — isolate all three so the fingerprinted ~/... token files
+    # resolve under the tmp home on every host (cf. test_image_routing.py).
+    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.delenv("HOMEDRIVE", raising=False)
+    monkeypatch.delenv("HOMEPATH", raising=False)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     monkeypatch.delenv("TEST_FP_EXT_CMD", raising=False)
     creds = home / ".claude" / ".credentials.json"
@@ -103,3 +118,51 @@ class TestPickerSurvivesRotation:
             rows = cached_provider_model_ids(PROVIDER, non_blocking=True)
         assert "claude-sonnet-5-5" in rows
         swr.assert_not_called()
+
+
+def _write_hosts(home, user, token):
+    """Write a github-copilot hosts.json login for *user* with a fresh mtime."""
+    hosts = home / ".config" / "github-copilot" / "hosts.json"
+    hosts.parent.mkdir(parents=True, exist_ok=True)
+    hosts.write_text(
+        json.dumps({"github.com": {"user": user, "oauth_token": token}}), encoding="utf-8")
+    # mtime granularity: ext4 is ns, but be explicit for coarse filesystems.
+    stamp = time.time() + 5
+    os.utime(hosts, (stamp, stamp))
+    return hosts
+
+
+class TestCopilotAcpLoginSignal:
+    """copilot-acp keeps tracking hosts.json: the ACP session is the only source
+    reflecting the account's enablement, so an account switch (or logout) must
+    invalidate the cached row instead of serving the previous account's catalog."""
+
+    def test_account_switch_invalidates(self, isolated_creds):
+        home = isolated_creds.parent.parent
+        _write_hosts(home, "alice", "tok-a")
+        before = _credential_fingerprint(COPILOT_ACP)
+        _write_hosts(home, "bob", "tok-b")
+        assert _credential_fingerprint(COPILOT_ACP) != before
+
+    def test_stale_row_not_served_after_switch(self, isolated_creds):
+        home = isolated_creds.parent.parent
+        _write_hosts(home, "alice", "tok-a")
+        update_provider_cache_entry(COPILOT_ACP, ["model-alice-1"])
+        _write_hosts(home, "bob", "tok-b")
+        with patch.object(models_mod, "_spawn_swr_refresh") as swr:
+            assert cached_provider_model_ids(COPILOT_ACP, non_blocking=True) == []
+        swr.assert_called_once_with(COPILOT_ACP)
+
+    def test_absent_login_invalidates(self, isolated_creds):
+        home = isolated_creds.parent.parent
+        hosts = _write_hosts(home, "alice", "tok-a")
+        before = _credential_fingerprint(COPILOT_ACP)
+        hosts.unlink()
+        assert _credential_fingerprint(COPILOT_ACP) != before
+
+    def test_claude_rotation_keeps_copilot_fingerprint(self, isolated_creds):
+        home = isolated_creds.parent.parent
+        _write_hosts(home, "alice", "tok-a")
+        before = _credential_fingerprint(COPILOT_ACP)
+        _rotate(isolated_creds)
+        assert _credential_fingerprint(COPILOT_ACP) == before
