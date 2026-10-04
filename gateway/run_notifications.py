@@ -964,11 +964,25 @@ class GatewayNotificationsMixin:
         }
 
     def _reachable_home_channel_targets(self) -> set[tuple[str, str, Optional[str]]]:
-        """Notice keys of every served home channel with a live transport right now."""
-        return {
-            _served_notice_target_key(profile, platform.value, home.chat_id, home.thread_id)
-            for profile, platform, _cfg, home, _transport in self._served_home_channel_transports()
-        }
+        """Notice keys of every served home channel with a live transport right now.
+
+        A resolved transport only proves the adapter is present in the map, not that it
+        can send: a Telegram reconnect intentionally publishes its adapter while
+        ``send_path_degraded=True``, and ``send()`` then returns ``send_path_degraded``
+        without contacting Telegram. Such a target is unreachable for expiry purposes,
+        or an aged marker would linger until another process restart.
+        """
+        reachable: set[tuple[str, str, Optional[str]]] = set()
+        for profile, platform, _cfg, home, _transport in self._served_home_channel_transports():
+            adapter = getattr(_transport, "adapter", None)
+            try:
+                degraded = bool(getattr(adapter, "send_path_degraded", False))
+            except Exception:
+                degraded = False
+            if degraded:
+                continue
+            reachable.add(_served_notice_target_key(profile, platform.value, home.chat_id, home.thread_id))
+        return reachable
 
     def _planned_restart_marker_expired(self, data: dict) -> bool:
         """True once the marker outlived ``_MAX_PLANNED_RESTART_NOTICE_AGE_SECS`` (numeric stamp only)."""
