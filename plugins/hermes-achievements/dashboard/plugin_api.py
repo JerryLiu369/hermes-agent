@@ -139,9 +139,12 @@ ACHIEVEMENTS: List[Dict[str, Any]] = [
 
 SNAPSHOT_FILE = "scan_snapshot.json"
 CHECKPOINT_FILE = "scan_checkpoint.json"
-# Checkpoint schema 2: per-session stats read the compaction-archived display history, not just
-# the active window. Version 1 caches were computed active-only and are rescanned once.
-_CHECKPOINT_SCHEMA_VERSION = 2
+# Checkpoint schema 3: per-session stats read the full session history (active, compacted, and
+# inactive rows) deduped per message_uid, not just the active window or the grouped display
+# projection. Version 1 caches were computed active-only; version 2 caches came from the display
+# projection (which dropped inactive rows, grouped away intermediate tool calls, and replayed
+# superseded rewind generations). Both are rescanned once.
+_CHECKPOINT_SCHEMA_VERSION = 3
 
 
 def _data_dir() -> Path:
@@ -289,7 +292,30 @@ def is_local_model_name(model_name: str) -> bool:
     return bool(name) and name != "none" and any(marker in name for marker in _LOCAL_MARKERS)
 
 
+def _dedupe_superseded_messages(messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Keep only the newest row per ``message_uid``.
+
+    Rewinds/retries (``/undo``, ``/retry``) soft-archive the superseded rows (``active=0``) and
+    re-insert the current generation under the SAME ``message_uid``; compaction clones carry the
+    original's uid too. A full-history scan (``include_inactive=True``) therefore sees both
+    generations, and counting both double-counts work that was undone or merely carried forward.
+    Rows without a uid are never merged (legacy rows / synthetic callers).
+    """
+    newest: Dict[str, Dict[str, Any]] = {}
+    for msg in messages:
+        uid = msg.get("message_uid")
+        if not uid:
+            continue
+        prev = newest.get(uid)
+        if prev is None or int(msg.get("id") or 0) >= int(prev.get("id") or 0):
+            newest[uid] = msg
+    if not newest:
+        return messages
+    return [m for m in messages if not m.get("message_uid") or newest.get(m["message_uid"]) is m]
+
+
 def analyze_messages(session_id: str, title: str, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+    messages = _dedupe_superseded_messages(messages)
     tool_names: Set[str] = set()
     tool_sequence: List[str] = []
     files_touched: Set[str] = set()
