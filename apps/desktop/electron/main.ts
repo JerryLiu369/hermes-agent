@@ -12765,15 +12765,24 @@ async function prepareProfileRenameRequest(request) {
 const ISOLATED_BACKEND = process.env.HERMES_DESKTOP_ISOLATED_BACKEND === '1'
 let attachedBackendMonitor: NodeJS.Timeout | null = null
 let attachedProbeInFlight = false
+// Epoch fencing for the single-flight guard above: every monitor start and
+// every stop mints a fresh generation. A probe captures its tick's generation
+// and may only release the guard or tear down the slot while it is still
+// current, so a superseded monitor's late completion can neither release the
+// new monitor's guard nor invalidate the new connection.
+let attachedMonitorGeneration = 0
 let hostSpawnReservation: SpawnReservation | null = null
 
 function stopAttachedBackendMonitor() {
+  // Supersede any pending probe WITHOUT releasing its ownership: clearing the
+  // interval does not cancel the in-flight readiness op, and that op still
+  // owns the guard until it settles (its completion is fenced by generation).
+  attachedMonitorGeneration += 1
+
   if (attachedBackendMonitor) {
     clearInterval(attachedBackendMonitor)
     attachedBackendMonitor = null
   }
-
-  attachedProbeInFlight = false
 }
 
 /**
@@ -12796,6 +12805,14 @@ function stopAttachedBackendMonitor() {
  * pending start also defers the teardown so the monitor never supersedes the
  * recovery it just scheduled.
  *
+ * Replacement while a probe is pending mints a fresh epoch (see
+ * attachedMonitorGeneration): the superseded probe keeps its ownership until
+ * it settles, but its completion is fenced — it releases the guard and may
+ * declare the backend gone only while its own generation is still current.
+ * The new epoch starts with a free guard even though the old op is still
+ * settling, and the old op's late arrival can never double-start the new
+ * monitor nor tear down its slot.
+ *
  * This teardown is unexpected, not intentional (nobody asked for a re-home),
  * so it must clear the slot via `backendConnectionState.invalidate()` directly
  * rather than `invalidatePrimaryConnection()`: the latter also sets
@@ -12805,10 +12822,22 @@ function stopAttachedBackendMonitor() {
  */
 function startAttachedBackendMonitor(attached: AttachedBackend) {
   stopAttachedBackendMonitor()
+  attachedMonitorGeneration += 1
+  const generation = attachedMonitorGeneration
+  // Fresh slot for the new epoch. A superseded probe may still be settling in
+  // the background; it is fenced by `generation` and cannot touch this guard.
+  attachedProbeInFlight = false
 
   const liveness = createAttachedLivenessTracker(ATTACHED_LIVENESS_FAILURE_THRESHOLD)
 
-  const declareGone = (reason: string) => {
+  const declareGone = (reason: string, probeGeneration: number) => {
+    // Fence superseded completions: only the live epoch may tear down this
+    // slot. A stale probe settling after replacement must not invalidate the
+    // new connection nor schedule recovery for it.
+    if (probeGeneration !== attachedMonitorGeneration) {
+      return
+    }
+
     // A start is already racing to replace this backend (a previous tick's
     // recovery, or a user-driven re-home): let it land instead of bumping the
     // generation again and superseding its pending callers.
@@ -12833,6 +12862,7 @@ function startAttachedBackendMonitor(attached: AttachedBackend) {
     }
 
     attachedProbeInFlight = true
+    const tickGeneration = generation
 
     void (async () => {
       try {
@@ -12846,7 +12876,7 @@ function startAttachedBackendMonitor(attached: AttachedBackend) {
 
         if (!pidAlive) {
           liveness.noteHardFailure()
-          declareGone('pid gone')
+          declareGone('pid gone', tickGeneration)
           return
         }
 
@@ -12867,7 +12897,7 @@ function startAttachedBackendMonitor(attached: AttachedBackend) {
 
         if (isAttachedBackendTokenDrifted({ servedToken, adoptedToken: attached.token })) {
           liveness.noteHardFailure()
-          declareGone('token drifted')
+          declareGone('token drifted', tickGeneration)
           return
         }
 
@@ -12877,14 +12907,14 @@ function startAttachedBackendMonitor(attached: AttachedBackend) {
 
         if (kind === 'hard') {
           liveness.noteHardFailure()
-          declareGone(error instanceof Error ? error.message : String(error))
+          declareGone(error instanceof Error ? error.message : String(error), tickGeneration)
           return
         }
 
         const exhausted = liveness.noteTransientFailure()
 
         if (exhausted) {
-          declareGone(error instanceof Error ? error.message : String(error))
+          declareGone(error instanceof Error ? error.message : String(error), tickGeneration)
         } else {
           rememberLog(
             `[attach] attached backend on ${attached.baseUrl} transient probe failure ` +
@@ -12893,7 +12923,13 @@ function startAttachedBackendMonitor(attached: AttachedBackend) {
           )
         }
       } finally {
-        attachedProbeInFlight = false
+        // Only the owning epoch releases the guard. A superseded probe
+        // settling after replacement must leave the new monitor's guard alone,
+        // or the new monitor's next tick would double-start while its first
+        // probe is still pending.
+        if (tickGeneration === attachedMonitorGeneration) {
+          attachedProbeInFlight = false
+        }
       }
     })()
   }, ATTACHED_LIVENESS_POLL_MS)
