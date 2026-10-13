@@ -263,6 +263,7 @@ class TestParseDirectComparisonOutputCaps:
         ("'max_tokens': 65536 is greater than the maximum of 4096 - 'max_tokens'", 4096),
         ("max_tokens is greater than the maximum of 8192", 8192),
         ("max_tokens cannot be greater than max_model_len=8192", 8192),
+        ("max_tokens=393216 cannot be greater than max_model_len=max_total_tokens=262144", 262144),
         ("max_tokens cannot be greater than max_model_len=8192 (request id: req_abc123)", 8192),
         ("max_tokens cannot be greater than 4096", 4096),
     ])
@@ -291,4 +292,3 @@ class TestParseDirectComparisonOutputCaps:
     def test_non_token_fields_are_not_output_cap(self, msg):
         assert parse_available_output_tokens_from_error(msg) is None
         assert is_output_cap_error(msg) is False
-

@@ -1318,8 +1318,8 @@ def parse_available_output_tokens_from_error(error_msg: str) -> Optional[int]:
         # cannot be greater than 2") do not match (#129737 review).
         r'(?:max_tokens|max_completion_tokens|max_output_tokens)\b.*?exceeds?\s+the\s+limit\s+of\s*(\d+)',
         r'(?:max_tokens|max_completion_tokens|max_output_tokens)\b.*?(?:is\s+)?greater than the maximum of\s*(\d+)',
-        r'(?:max_tokens|max_completion_tokens|max_output_tokens)\b.*?cannot be greater than\s*(?:max_model_len\s*=\s*)?(\d+)',
-        r'cannot be greater than\s*max_model_len\s*=\s*(\d+)',
+        r'(?:max_tokens|max_completion_tokens|max_output_tokens)\b.*?cannot be greater than\s*(?:max_model_len\s*=\s*(?:max_total_tokens\s*=\s*)?)?(\d+)',
+        r'cannot be greater than\s*max_model_len\s*=\s*(?:max_total_tokens\s*=\s*)?(\d+)',
         r'=\s*(\d+)\s*$',
     ):
         match = re.search(pattern, error_lower)
