@@ -1,0 +1,135 @@
+diff --git a/gateway/platforms/weixin.py b/gateway/platforms/weixin.py
+index 59710ed248..7bc15fd771 100644
+--- a/gateway/platforms/weixin.py
++++ b/gateway/platforms/weixin.py
+@@ -344,12 +344,36 @@ async def _upload_ciphertext(session: aiohttp.ClientSession, *, ciphertext: byte
+     return await asyncio.wait_for(_do(), timeout=120)
+ 
+ 
+-async def _download_bytes(session: aiohttp.ClientSession, *, url: str, timeout_seconds: float = 60.0) -> bytes:
+-    async def _do() -> bytes:
+-        async with session.get(url) as response:
+-            response.raise_for_status()
+-            return await response.read()
+-    return await asyncio.wait_for(_do(), timeout=timeout_seconds)
++async def _download_bytes(session: aiohttp.ClientSession, *, url: str, timeout_seconds: float = 120.0) -> bytes:
++    def _fetch_sync() -> bytes:
++        import subprocess
++        logger.warning("Weixin download starting via curl: url=%s timeout=%s", url[:120], timeout_seconds)
++        cmd = [
++            "curl", "-sSL",
++            "--connect-timeout", "15",
++            "-m", str(int(timeout_seconds)),
++            "-A", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
++            url
++        ]
++        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
++        if res.returncode == 0 and len(res.stdout) > 0:
++            logger.warning("Weixin download finished via curl: %d bytes", len(res.stdout))
++            return res.stdout
++        logger.warning("curl failed (exit %s, stderr=%r), trying urllib chunked...", res.returncode, res.stderr[:100])
++        import urllib.request, ssl, certifi
++        ctx = ssl.create_default_context(cafile=certifi.where())
++        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"})
++        with urllib.request.urlopen(req, timeout=timeout_seconds, context=ctx) as resp:
++            chunks = []
++            while True:
++                chunk = resp.read(65536)
++                if not chunk:
++                    break
++                chunks.append(chunk)
++            data = b"".join(chunks)
++            logger.warning("Weixin download finished via urllib: %d bytes", len(data))
++            return data
++    return await asyncio.to_thread(_fetch_sync)
+ 
+ 
+ _WEIXIN_CDN_ALLOWLIST: frozenset[str] = frozenset({
+@@ -364,7 +388,7 @@ def _assert_weixin_cdn_url(url: str) -> None:
+         raise ValueError(f"Unparseable media URL: {url!r}") from exc
+     if scheme not in {"http", "https"}:
+         raise ValueError(f"Media URL has disallowed scheme {scheme!r}; only http/https are permitted.")
+-    if host not in _WEIXIN_CDN_ALLOWLIST:
++    if host not in _WEIXIN_CDN_ALLOWLIST and not host.endswith((".weixin.qq.com", ".qpic.cn", ".qlogo.cn")):
+         raise ValueError(f"Media URL host {host!r} is not in the WeChat CDN allowlist. Refusing to fetch to prevent SSRF.")
+ 
+ 
+@@ -372,13 +396,14 @@ async def _download_and_decrypt_media(
+     session: aiohttp.ClientSession, *, cdn_base_url: str, encrypted_query_param: Optional[str], aes_key_b64: Optional[str],
+     full_url: Optional[str], timeout_seconds: float,
+ ) -> bytes:
+-    if encrypted_query_param:
+-        url = f"{cdn_base_url.rstrip('/')}/download?encrypted_query_param={quote(encrypted_query_param, safe='')}"
+-    elif full_url:
++    if full_url:
+         _assert_weixin_cdn_url(full_url)
+         url = full_url
++    elif encrypted_query_param:
++        url = f"{cdn_base_url.rstrip('/')}/download?encrypted_query_param={quote(encrypted_query_param, safe='')}"
+     else:
+         raise RuntimeError("media item had neither encrypt_query_param nor full_url")
++    logger.info("Weixin media downloading: url=%s timeout=%s", url[:120], timeout_seconds)
+     raw = await _download_bytes(session, url=url, timeout_seconds=timeout_seconds)
+     return _aes128_ecb_decrypt(raw, _parse_aes_key(aes_key_b64)) if aes_key_b64 else raw
+ 
+@@ -676,7 +701,7 @@ _video_item, _voice_item = partial(_media_item, ITEM_VIDEO), partial(_media_item
+ _INBOUND_MEDIA: dict[int, tuple[str, float, Callable[[bytes, str], Awaitable[str]], Optional[str], str]] = {
+     ITEM_IMAGE: ("image_item", 30.0, lambda data, _name: cache_image_from_bytes_async(data, ".jpg"), "image/jpeg", "image"),
+     ITEM_VIDEO: ("video_item", 120.0, lambda data, _name: cache_document_from_bytes_async(data, "video.mp4"), "video/mp4", "video"),
+-    ITEM_FILE: ("file_item", 60.0, lambda data, name: cache_document_from_bytes_async(data, name), None, "file"),
++    ITEM_FILE: ("file_item", 180.0, lambda data, name: cache_document_from_bytes_async(data, name), None, "file"),
+     ITEM_VOICE: ("voice_item", 60.0, lambda data, _name: cache_audio_from_bytes_async(data, ".silk"), "audio/silk", "voice"),
+ }
+ 
+@@ -897,7 +922,11 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
+             for candidate in (item, ref_item) if isinstance(ref_item, dict) else (item,):
+                 await self._collect_media(candidate, media_paths, media_types)
+         if not text and not media_paths:
+-            return
++            had_media_items = any(item.get("type") in {ITEM_IMAGE, ITEM_VOICE, ITEM_FILE, ITEM_VIDEO} for item in item_list)
++            if had_media_items:
++                text = "[附件下载失败：微信传输超时或CDN解析错误]"
++            else:
++                return
+         source = self.build_source(chat_id=effective_chat_id, chat_type=chat_type, user_id=sender_id, user_name=sender_id)
+         event = MessageEvent(
+             text=text, message_type=_message_type_from_media(media_types, text), source=source, raw_message=message,
+@@ -916,13 +945,27 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
+             media_types.append(mime)
+ 
+     async def _download_media(self, item: dict[str, Any], spec: tuple[Any, ...]) -> tuple[Optional[str], str]:
+-        """Download + decrypt one inbound media item -> (cached path or None, mime). Voice is always downloaded
+-        (never trust Tencent's ``voice_item.text``) so gateway/run.py's central STT re-transcribes."""
++        """Download + decrypt one inbound media item -> (cached path or None, mime)."""
+         item_key, timeout_seconds, cache_fn, mime, label = spec
+         payload = item.get(item_key) or {}
+         media = payload.get("media") or {}
+         filename = str(payload.get("file_name") or "document.bin")
+         mime = mime or mimetypes.guess_type(filename)[0] or "application/octet-stream"
++
++        # Persist raw media metadata immediately so it can be retried / inspected if download fails
++        try:
++            dump_path = Path(self._hermes_home) / "cache" / "last_inbound_media.json"
++            dump_path.parent.mkdir(parents=True, exist_ok=True)
++            dump_path.write_text(json.dumps({
++                "item_key": item_key,
++                "filename": filename,
++                "mime": mime,
++                "payload": payload,
++                "media": media,
++                "timestamp": datetime.now().isoformat()
++            }, ensure_ascii=False, indent=2))
++        except Exception as e:
++            logger.debug("Failed to dump raw media metadata: %s", e)
+         try:
+             aes_key_b64 = media.get("aes_key")
+             if item_key == "image_item" and payload.get("aeskey"):  # image_item may carry a raw hex ``aeskey`` beside the media block
+@@ -937,7 +980,7 @@ class WeixinAdapter(OwnAccessPolicyMixin, BasePlatformAdapter):
+                 aes_key_b64=aes_key_b64, full_url=media.get("full_url"), timeout_seconds=timeout_seconds)
+             return await cache_fn(data, filename), mime
+         except Exception as exc:
+-            logger.warning("[%s] %s download failed: %s", self.name, label, exc)
++            logger.warning("[%s] %s download failed: %r (%s)", self.name, label, exc, type(exc).__name__, exc_info=True)
+             return None, mime
+ 
+     async def _fetch_typing_ticket(self, session: Any, user_id: str, context_token: Optional[str], failure_label: str) -> Optional[str]:

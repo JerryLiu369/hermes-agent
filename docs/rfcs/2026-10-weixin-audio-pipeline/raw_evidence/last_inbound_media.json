@@ -1,0 +1,21 @@
+{
+  "item_key": "file_item",
+  "filename": "3333(1)(1).m4a",
+  "mime": "audio/mp4",
+  "payload": {
+    "media": {
+      "encrypt_query_param": "[REDACTED_QUERY_PARAM]",
+      "aes_key": "[REDACTED_TRANSIENT_AES_KEY]",
+      "full_url": "https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=[REDACTED]&taskid=62c0f7a641ea58d259fc4abc8d467db2"
+    },
+    "file_name": "3333(1)(1).m4a",
+    "md5": "36edf31215b3882c9398d205513223e5",
+    "len": "5184000"
+  },
+  "media": {
+    "encrypt_query_param": "[REDACTED_QUERY_PARAM]",
+    "aes_key": "[REDACTED_TRANSIENT_AES_KEY]",
+    "full_url": "https://novac2c.cdn.weixin.qq.com/c2c/download?encrypted_query_param=[REDACTED]&taskid=62c0f7a641ea58d259fc4abc8d467db2"
+  },
+  "timestamp": "2026-10-15T18:37:47.241554"
+}
