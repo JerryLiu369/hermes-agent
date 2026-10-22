@@ -1298,7 +1298,27 @@ def list_authenticated_providers(
     if custom_providers and isinstance(custom_providers, list):
         _lap_custom_provider_rows(b, custom_providers)
 
-    return _finalize_picker_rows(b.results, user_providers, current_model)
+    rows = _finalize_picker_rows(b.results, user_providers, current_model)
+
+    # ``model_catalog.excluded_providers`` must be matched against every spelling a provider
+    # can surface as. Built-in rows carry the hermes/models.dev id, but entries declared under
+    # ``providers:`` are normalized by ``get_compatible_custom_providers`` into custom
+    # providers whose slug is ``custom:<name>``; comparing that raw slug against the configured
+    # entry never matches, so the exclusion silently did nothing for them.
+    if b.excluded:
+        def _exclusion_key(value) -> str:
+            key = str(value or "").strip().lower()
+            return key.split(":", 1)[1] if key.startswith("custom:") else key
+
+        # Normalize both sides: the row slug carries a ``custom:`` prefix while the configured
+        # entry usually does not (``custom:back1`` vs ``back1``), and a user may write either.
+        excluded_norm = set(b.excluded) | {_exclusion_key(v) for v in b.excluded}
+        rows = [
+            r for r in rows
+            if _exclusion_key(r.get("slug")) not in excluded_norm
+            and _exclusion_key(r.get("provider_id")) not in excluded_norm
+        ]
+    return rows
 
 
 def _finalize_picker_rows(results: list, user_providers, current_model: str) -> list:
